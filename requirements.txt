@@ -1,0 +1,10 @@
+fastapi
+logger
+asyncio
+uvicorn
+httpx
+pendulum
+aiologger
+python-dotenv
+firebase_admin
+websockets
