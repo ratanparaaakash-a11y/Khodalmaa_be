@@ -7,8 +7,8 @@ async def test_api():
     url = "https://be.khodalmaa.in/api/v1/project2_data"  # Change to your API endpoint
 
     payloads = [
-        {"machine2": [10, 2, 3, 4, 5, 6, 7, 8, 9, 1]},
-        {"machine4": [11, 2, 3, 4, 5, 6, 7, 8, 9, 1]},
+        {"machine2": [1,2,3,4,5,6,7,8,9,10]},
+        {"machine4": [1]},
     ]
 
     async with httpx.AsyncClient() as client:
@@ -768,5 +768,6 @@ async def test_api_1():
 while True:
     time.sleep(5)
     asyncio.run(test_api_1())
+    asyncio.run(test_api())
 
 
