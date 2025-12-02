@@ -28,8 +28,6 @@ async def get_p1_data(req: Request):
         print(f"An Error occurred on our site project1 {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# 8487861177:AAEUdvjNiNpGENMQyEzGbFSr5xhorUCDvQA
-# 6925499700
 @Project1Router.websocket("/ws_project1")
 async def ws_project1(websocket: WebSocket):
     await websocket.accept()
