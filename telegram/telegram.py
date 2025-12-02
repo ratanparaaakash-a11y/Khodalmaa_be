@@ -65,17 +65,26 @@ async def send_telegram_alert(req: Request):
         telegram_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         payload = {
             "chat_id": chat_id,
-            "text": formatted_message,
+            "text": table1,
+            "parse_mode": "HTML"
+        }
+        payload2 = {
+            "chat_id": chat_id,
+            "text": table2,
             "parse_mode": "HTML"
         }
 
         async with httpx.AsyncClient() as client:
             response = await client.post(telegram_url, json=payload)
             print("Telegram response:", response.json())
+            response2 = await client.post(telegram_url, json=payload2)
+            print("Telegram response:", response2.json())
+
             return {
-                "telegram_response": response.json(),
-                "formatted_message": formatted_message
+                "telegram_response_for_msg1": response.json(),
+                "telegram_response_for_msg2": response2.json(),                
             }
+            
 
     except Exception as e:
         print("Error:", str(e))
