@@ -1,4 +1,5 @@
 from fastapi import Request, APIRouter, HTTPException, WebSocket
+import time
 
 Project1Router = APIRouter(prefix="/api/v1")
 
@@ -11,6 +12,7 @@ async def get_p1_data(req: Request):
     try:
         data = await req.json()
         print(f"project1 data: {data}")
+        print("DATA RECEIVED AT:", time.time())
 
         # Merge arrays per machine
         for machine_id, values in data.items():

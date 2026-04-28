@@ -1,6 +1,7 @@
 from fastapi import Request, APIRouter, HTTPException, WebSocket
-
+import time
 Project2Router = APIRouter(prefix="/api/v1")
+
 
 latest_project2_data = {}
 connections_project2 = []
@@ -11,7 +12,7 @@ async def get_p2_data(req: Request):
     try:
         data = await req.json()
         print(f"project2 raw data: {data}")
-
+        print("DATA RECEIVED AT:", time.time())
         filtered_data = {}
 
         for machine_id, values in data.items():
