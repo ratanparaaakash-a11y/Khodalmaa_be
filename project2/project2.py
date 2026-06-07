@@ -1,4 +1,6 @@
-from fastapi import Request, APIRouter, HTTPException, WebSocket
+import asyncio
+
+from fastapi import Request, APIRouter, BackgroundTasks, HTTPException, WebSocket
 import time
 Project2Router = APIRouter(prefix="/api/v1")
 
@@ -7,12 +9,26 @@ latest_project2_data = {}
 connections_project2 = []
 
 
+async def broadcast_project2_data(data):
+    stale_connections = []
+
+    for conn in connections_project2.copy():
+        try:
+            await asyncio.wait_for(conn.send_json(data), timeout=1)
+        except Exception as e:
+            print(f"Error sending to Project2 WebSocket: {e}")
+            stale_connections.append(conn)
+
+    for conn in stale_connections:
+        if conn in connections_project2:
+            connections_project2.remove(conn)
+
+
 @Project2Router.post("/project2_data")
-async def get_p2_data(req: Request):
+async def get_p2_data(req: Request, background_tasks: BackgroundTasks):
     try:
         data = await req.json()
-        print(f"project2 raw data: {data}")
-        print("DATA RECEIVED AT:", time.time())
+        print(f"project2 machines: {list(data.keys())} at {time.time()}")
         filtered_data = {}
 
         for machine_id, values in data.items():
@@ -35,12 +51,7 @@ async def get_p2_data(req: Request):
             filtered_data[machine_id] = values
             latest_project2_data[machine_id] = values
 
-        for conn in connections_project2.copy():
-            try:
-                await conn.send_json(filtered_data)
-            except Exception as e:
-                print(f"Error sending to WebSocket: {e}")
-                connections_project2.remove(conn)
+        background_tasks.add_task(broadcast_project2_data, filtered_data)
 
         return {"status": "success", "data": filtered_data}
 

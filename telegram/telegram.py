@@ -1,4 +1,5 @@
 from fastapi import  Request,APIRouter,HTTPException
+import asyncio
 import httpx
 import os
 
@@ -15,20 +16,15 @@ async def send_telegram_alert(req: Request):
 
         data = await req.json()
         raw_message = data.get("message", "")
-        print("Raw message:", raw_message)
-
         # Convert CSV string to list
         numbers = [n.strip() for n in raw_message.split(",") if n.strip()]
-        print("Parsed numbers:", numbers)
+        print(f"Parsed {len(numbers)} numbers")
 
         total = len(numbers)
         half = total // 2
 
         group1 = numbers[:half]
         group2 = numbers[half:]
-
-        print("Group 1:", group1)
-        print("Group 2:", group2)
 
         # Build ASCII table block
         def build_table(group):
@@ -52,15 +48,10 @@ async def send_telegram_alert(req: Request):
                 rows.append(border())
 
             table_output = "\n".join(rows)
-            print("Table created:\n" + table_output)
             return table_output
 
         table1 = build_table(group1)
         table2 = build_table(group2)
-
-        formatted_message = f"<pre>{table1}\n\n{table2}</pre>"
-
-        print("Final formatted message:\n", formatted_message)
 
         telegram_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         payload = {
@@ -74,11 +65,13 @@ async def send_telegram_alert(req: Request):
             "parse_mode": "HTML"
         }
 
-        async with httpx.AsyncClient() as client:
-            response = await client.post(telegram_url, json=payload)
-            print("Telegram response:", response.json())
-            response2 = await client.post(telegram_url, json=payload2)
-            print("Telegram response:", response2.json())
+        timeout = httpx.Timeout(10.0, connect=5.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response, response2 = await asyncio.gather(
+                client.post(telegram_url, json=payload),
+                client.post(telegram_url, json=payload2),
+            )
+            print("Telegram responses:", response.status_code, response2.status_code)
 
             return {
                 "telegram_response_for_msg1": response.json(),
