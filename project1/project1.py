@@ -29,14 +29,21 @@ async def get_p1_data(req: Request, background_tasks: BackgroundTasks):
     try:
         data = await req.json()
         print(f"project1 machines: {list(data.keys())} at {time.time()}")
+        normalized_data = {}
 
         # Merge arrays per machine
         for machine_id, values in data.items():
-            latest_project1_data[machine_id] = values
+            if not isinstance(machine_id, str) or not machine_id.lower().startswith("machine"):
+                print(f"Skipping invalid project1 key: {machine_id}")
+                continue
 
-        background_tasks.add_task(broadcast_project1_data, data)
+            normalized_machine_id = machine_id.lower()
+            latest_project1_data[normalized_machine_id] = values
+            normalized_data[normalized_machine_id] = values
 
-        return {"status": "success", "data": data}
+        background_tasks.add_task(broadcast_project1_data, normalized_data)
+
+        return {"status": "success", "data": normalized_data}
 
     except Exception as e:
         print(f"An Error occurred on our site project1 {str(e)}")
