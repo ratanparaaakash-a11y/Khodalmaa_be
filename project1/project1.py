@@ -10,14 +10,20 @@ latest_project1_data = {}
 connections_project1 = []
 
 async def broadcast_project1_data(data):
-    stale_connections = []
-
-    for conn in connections_project1.copy():
+    async def send_to_connection(conn):
         try:
             await asyncio.wait_for(conn.send_json(data), timeout=1)
+            return None
         except Exception as e:
             print(f"Error sending to Project1 WebSocket: {e}")
-            stale_connections.append(conn)
+            return conn
+
+    stale_connections = [
+        conn for conn in await asyncio.gather(
+            *(send_to_connection(conn) for conn in connections_project1.copy())
+        )
+        if conn is not None
+    ]
 
     for conn in stale_connections:
         if conn in connections_project1:
