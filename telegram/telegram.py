@@ -1,5 +1,4 @@
 from fastapi import  Request,APIRouter,HTTPException
-import asyncio
 import httpx
 import os
 
@@ -15,67 +14,30 @@ async def send_telegram_alert(req: Request):
         print("\nIncoming request to /send-alert")
 
         data = await req.json()
-        raw_message = data.get("message", "")
-        # Convert CSV string to list
-        numbers = [n.strip() for n in raw_message.split(",") if n.strip()]
-        print(f"Parsed {len(numbers)} numbers")
+        raw_message = str(data.get("message", "")).strip()
+        telegram_text = "\n".join(
+            line.strip()
+            for line in raw_message.replace("\r\n", "\n").split("\n")
+            if line.strip()
+        )
+        if not telegram_text:
+            raise HTTPException(status_code=400, detail="message is required")
 
-        total = len(numbers)
-        half = total // 2
-
-        group1 = numbers[:half]
-        group2 = numbers[half:]
-
-        # Build ASCII table block
-        def build_table(group):
-            if not group:
-                return ""
-
-            max_width = max(len(item) for item in group)
-            col_width = max(max_width, 5)
-
-            def border():
-                return "+" + "+".join(["-" * (col_width + 2)] * 4) + "+"
-
-            rows = [border()]
-            for i in range(0, len(group), 4):
-                row_items = group[i:i + 4]
-                while len(row_items) < 4:
-                    row_items.append("")
-
-                row = "|" + "|".join(f" {item.center(col_width)} " for item in row_items) + "|"
-                rows.append(row)
-                rows.append(border())
-
-            table_output = "\n".join(rows)
-            return table_output
-
-        table1 = build_table(group1)
-        table2 = build_table(group2)
+        print(f"Sending Telegram message with {len(telegram_text.splitlines())} line(s)")
 
         telegram_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         payload = {
             "chat_id": chat_id,
-            "text": table1,
-            "parse_mode": "HTML"
-        }
-        payload2 = {
-            "chat_id": chat_id,
-            "text": table2,
-            "parse_mode": "HTML"
+            "text": telegram_text,
         }
 
         timeout = httpx.Timeout(10.0, connect=5.0)
         async with httpx.AsyncClient(timeout=timeout) as client:
-            response, response2 = await asyncio.gather(
-                client.post(telegram_url, json=payload),
-                client.post(telegram_url, json=payload2),
-            )
-            print("Telegram responses:", response.status_code, response2.status_code)
+            response = await client.post(telegram_url, json=payload)
+            print("Telegram response:", response.status_code)
 
             return {
-                "telegram_response_for_msg1": response.json(),
-                "telegram_response_for_msg2": response2.json(),                
+                "telegram_response": response.json(),
             }
             
 
