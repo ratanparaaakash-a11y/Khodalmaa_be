@@ -41,6 +41,8 @@ async def send_telegram_alert(req: Request):
             }
             
 
+    except HTTPException:
+        raise
     except Exception as e:
         print("Error:", str(e))
         raise HTTPException(status_code=500, detail=str(e))
