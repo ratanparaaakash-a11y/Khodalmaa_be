@@ -1,6 +1,7 @@
 import asyncio
 
 from fastapi import Request, APIRouter, BackgroundTasks, HTTPException, WebSocket
+from history.session_history import schedule_session_finalize
 import time
 
 Project1Router = APIRouter(prefix="/api/v1")
@@ -75,6 +76,7 @@ async def get_p1_data(req: Request, background_tasks: BackgroundTasks):
             latest_project1_data[normalized_machine_id] = values
             normalized_data[normalized_machine_id] = values
 
+        schedule_session_finalize("project220", latest_project1_data, project1_session_started_at)
         background_tasks.add_task(broadcast_project1_data, normalized_data, session_reset)
 
         return {"status": "success", "data": normalized_data}
