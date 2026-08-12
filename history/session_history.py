@@ -31,6 +31,7 @@ _session_number_cache = {}
 _memory_docs = {}
 _cached_token = None
 _cached_token_until = 0
+_firestore_disabled_until = 0
 
 
 def get_business_date(now=None):
@@ -102,8 +103,8 @@ def get_access_token():
     from google.oauth2 import service_account
 
     class TimeoutRequest(Request):
-        def __call__(self, url, method="GET", body=None, headers=None, timeout=6, **kwargs):
-            return super().__call__(url, method=method, body=body, headers=headers, timeout=6, **kwargs)
+        def __call__(self, url, method="GET", body=None, headers=None, timeout=3, **kwargs):
+            return super().__call__(url, method=method, body=body, headers=headers, timeout=3, **kwargs)
 
     credentials = service_account.Credentials.from_service_account_info(
         service_account_key,
@@ -124,6 +125,16 @@ def firestore_url(doc_id):
         f"https://firestore.googleapis.com/v1/projects/{project_id}"
         f"/databases/(default)/documents/{COLLECTION_NAME}/{safe_doc_id}"
     )
+
+
+def firestore_is_disabled():
+    return time.time() < _firestore_disabled_until
+
+
+def disable_firestore_temporarily(error):
+    global _firestore_disabled_until
+    _firestore_disabled_until = time.time() + 5 * 60
+    print(f"History Firestore temporarily disabled: {error}")
 
 
 def parse_arrow_entry(entry):
@@ -305,11 +316,14 @@ def build_snapshot(project, data, business_date, session, session_started_at, so
 
 def load_doc(project, business_date, session):
     doc_id = get_doc_id(project, business_date, session)
+    if firestore_is_disabled():
+        return _memory_docs.get(doc_id)
+
     try:
         response = httpx.get(
             firestore_url(doc_id),
             headers={"Authorization": f"Bearer {get_access_token()}"},
-            timeout=7,
+            timeout=3,
         )
         if response.status_code == 404:
             return _memory_docs.get(doc_id)
@@ -317,23 +331,28 @@ def load_doc(project, business_date, session):
         return plain_fields(response.json().get("fields", {}))
     except Exception as error:
         print(f"History Firestore read fallback for {doc_id}: {error}")
+        disable_firestore_temporarily(error)
     return _memory_docs.get(doc_id)
 
 
 def save_doc(snapshot):
     doc_id = get_doc_id(snapshot["project"], snapshot["business_date"], snapshot["session"])
     stored = {**snapshot, "doc_id": doc_id, "updated_at": get_now_iso()}
+    _memory_docs[doc_id] = stored
+    if firestore_is_disabled():
+        return stored
+
     try:
         response = httpx.patch(
             firestore_url(doc_id),
             headers={"Authorization": f"Bearer {get_access_token()}"},
             json={"fields": firestore_fields(stored)},
-            timeout=8,
+            timeout=3,
         )
         response.raise_for_status()
     except Exception as error:
         print(f"History Firestore write fallback for {doc_id}: {error}")
-        _memory_docs[doc_id] = stored
+        disable_firestore_temporarily(error)
     return stored
 
 
