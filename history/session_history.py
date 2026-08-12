@@ -1,7 +1,11 @@
 import asyncio
 import copy
+import json
+import os
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import HTTPException
@@ -32,6 +36,7 @@ _memory_docs = {}
 _cached_token = None
 _cached_token_until = 0
 _firestore_disabled_until = 0
+_file_store_dir = Path(os.getenv("HISTORY_STORE_DIR") or Path(tempfile.gettempdir()) / "khodalmaa_history")
 
 
 def get_business_date(now=None):
@@ -47,6 +52,34 @@ def get_now_iso():
 
 def get_doc_id(project, business_date, session):
     return f"{business_date}-s{session}-{project}"
+
+
+def get_file_path(doc_id):
+    return _file_store_dir / f"{doc_id}.json"
+
+
+def load_file_doc(doc_id):
+    try:
+        path = get_file_path(doc_id)
+        if not path.exists():
+            return None
+        with path.open("r", encoding="utf-8") as file:
+            return json.load(file)
+    except Exception as error:
+        print(f"History file read fallback failed for {doc_id}: {error}")
+    return None
+
+
+def save_file_doc(doc_id, data):
+    try:
+        _file_store_dir.mkdir(parents=True, exist_ok=True)
+        path = get_file_path(doc_id)
+        temp_path = path.with_suffix(".tmp")
+        with temp_path.open("w", encoding="utf-8") as file:
+            json.dump(data, file, separators=(",", ":"))
+        temp_path.replace(path)
+    except Exception as error:
+        print(f"History file write fallback failed for {doc_id}: {error}")
 
 
 def firestore_value(value):
@@ -316,8 +349,12 @@ def build_snapshot(project, data, business_date, session, session_started_at, so
 
 def load_doc(project, business_date, session):
     doc_id = get_doc_id(project, business_date, session)
+    local_doc = _memory_docs.get(doc_id) or load_file_doc(doc_id)
+    if local_doc:
+        return local_doc
+
     if firestore_is_disabled():
-        return _memory_docs.get(doc_id)
+        return None
 
     try:
         response = httpx.get(
@@ -326,19 +363,21 @@ def load_doc(project, business_date, session):
             timeout=3,
         )
         if response.status_code == 404:
-            return _memory_docs.get(doc_id)
+            return None
         response.raise_for_status()
         return plain_fields(response.json().get("fields", {}))
     except Exception as error:
         print(f"History Firestore read fallback for {doc_id}: {error}")
         disable_firestore_temporarily(error)
-    return _memory_docs.get(doc_id)
+    return None
 
 
 def save_doc(snapshot):
     doc_id = get_doc_id(snapshot["project"], snapshot["business_date"], snapshot["session"])
     stored = {**snapshot, "doc_id": doc_id, "updated_at": get_now_iso()}
     _memory_docs[doc_id] = stored
+    save_file_doc(doc_id, stored)
+
     if firestore_is_disabled():
         return stored
 
@@ -354,6 +393,19 @@ def save_doc(snapshot):
         print(f"History Firestore write fallback for {doc_id}: {error}")
         disable_firestore_temporarily(error)
     return stored
+
+
+def get_storage_status():
+    try:
+        file_docs = len(list(_file_store_dir.glob("*.json"))) if _file_store_dir.exists() else 0
+    except Exception:
+        file_docs = 0
+
+    return {
+        "memory_docs": len(_memory_docs),
+        "file_docs": file_docs,
+        "firestore_disabled_seconds": max(0, int(_firestore_disabled_until - time.time())),
+    }
 
 
 def get_existing_sessions(project, business_date):

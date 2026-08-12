@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 
 from history.session_history import (
     analyze_history,
+    get_storage_status,
     normalize_project,
     safe_days,
     safe_session,
@@ -16,7 +17,7 @@ HistoryRouter = APIRouter(prefix="/api/v1")
 
 @HistoryRouter.get("/history/health")
 async def history_health():
-    return {"status": "ok", "feature": "session_history"}
+    return {"status": "ok", "feature": "session_history", "storage": get_storage_status()}
 
 
 @HistoryRouter.get("/history")
