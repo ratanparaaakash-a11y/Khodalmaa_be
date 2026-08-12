@@ -2,8 +2,10 @@ import asyncio
 import copy
 import time
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 
 from fastapi import HTTPException
+import httpx
 
 from history.rules import (
     ALL_COLUMNS,
@@ -27,6 +29,8 @@ INDIA_TZ = timezone(timedelta(hours=5, minutes=30))
 _finalize_tasks = {}
 _session_number_cache = {}
 _memory_docs = {}
+_cached_token = None
+_cached_token_until = 0
 
 
 def get_business_date(now=None):
@@ -44,10 +48,82 @@ def get_doc_id(project, business_date, session):
     return f"{business_date}-s{session}-{project}"
 
 
-def get_firestore_tools():
-    from firebase_admin import firestore
+def firestore_value(value):
+    if value is None:
+        return {"nullValue": None}
+    if isinstance(value, bool):
+        return {"booleanValue": value}
+    if isinstance(value, int):
+        return {"integerValue": str(value)}
+    if isinstance(value, float):
+        return {"doubleValue": value}
+    if isinstance(value, list):
+        return {"arrayValue": {"values": [firestore_value(item) for item in value]}}
+    if isinstance(value, dict):
+        return {"mapValue": {"fields": {str(key): firestore_value(item) for key, item in value.items()}}}
+    return {"stringValue": str(value)}
 
-    return firestore, firestore.client().collection(COLLECTION_NAME)
+
+def firestore_fields(data):
+    return {str(key): firestore_value(value) for key, value in data.items()}
+
+
+def plain_value(value):
+    if "nullValue" in value:
+        return None
+    if "booleanValue" in value:
+        return value["booleanValue"]
+    if "integerValue" in value:
+        return int(value["integerValue"])
+    if "doubleValue" in value:
+        return float(value["doubleValue"])
+    if "stringValue" in value:
+        return value["stringValue"]
+    if "arrayValue" in value:
+        return [plain_value(item) for item in value.get("arrayValue", {}).get("values", [])]
+    if "mapValue" in value:
+        return {key: plain_value(item) for key, item in value.get("mapValue", {}).get("fields", {}).items()}
+    return None
+
+
+def plain_fields(fields):
+    return {key: plain_value(value) for key, value in (fields or {}).items()}
+
+
+def get_access_token():
+    global _cached_token, _cached_token_until
+
+    now = time.time()
+    if _cached_token and now < _cached_token_until:
+        return _cached_token
+
+    from constant import service_account_key
+    from google.auth.transport.requests import Request
+    from google.oauth2 import service_account
+
+    class TimeoutRequest(Request):
+        def __call__(self, url, method="GET", body=None, headers=None, timeout=6, **kwargs):
+            return super().__call__(url, method=method, body=body, headers=headers, timeout=6, **kwargs)
+
+    credentials = service_account.Credentials.from_service_account_info(
+        service_account_key,
+        scopes=["https://www.googleapis.com/auth/datastore"],
+    )
+    credentials.refresh(TimeoutRequest())
+    _cached_token = credentials.token
+    _cached_token_until = now + 45 * 60
+    return _cached_token
+
+
+def firestore_url(doc_id):
+    from constant import service_account_key
+
+    project_id = service_account_key.get("project_id")
+    safe_doc_id = quote(doc_id, safe="")
+    return (
+        f"https://firestore.googleapis.com/v1/projects/{project_id}"
+        f"/databases/(default)/documents/{COLLECTION_NAME}/{safe_doc_id}"
+    )
 
 
 def parse_arrow_entry(entry):
@@ -230,10 +306,15 @@ def build_snapshot(project, data, business_date, session, session_started_at, so
 def load_doc(project, business_date, session):
     doc_id = get_doc_id(project, business_date, session)
     try:
-        _, collection = get_firestore_tools()
-        snapshot = collection.document(doc_id).get(timeout=6)
-        if snapshot.exists:
-            return snapshot.to_dict()
+        response = httpx.get(
+            firestore_url(doc_id),
+            headers={"Authorization": f"Bearer {get_access_token()}"},
+            timeout=7,
+        )
+        if response.status_code == 404:
+            return _memory_docs.get(doc_id)
+        response.raise_for_status()
+        return plain_fields(response.json().get("fields", {}))
     except Exception as error:
         print(f"History Firestore read fallback for {doc_id}: {error}")
     return _memory_docs.get(doc_id)
@@ -241,13 +322,19 @@ def load_doc(project, business_date, session):
 
 def save_doc(snapshot):
     doc_id = get_doc_id(snapshot["project"], snapshot["business_date"], snapshot["session"])
+    stored = {**snapshot, "doc_id": doc_id, "updated_at": get_now_iso()}
     try:
-        firestore, collection = get_firestore_tools()
-        collection.document(doc_id).set({**snapshot, "doc_id": doc_id, "updated_at": firestore.SERVER_TIMESTAMP}, merge=True, timeout=8)
+        response = httpx.patch(
+            firestore_url(doc_id),
+            headers={"Authorization": f"Bearer {get_access_token()}"},
+            json={"fields": firestore_fields(stored)},
+            timeout=8,
+        )
+        response.raise_for_status()
     except Exception as error:
         print(f"History Firestore write fallback for {doc_id}: {error}")
-        _memory_docs[doc_id] = {**snapshot, "doc_id": doc_id}
-    return {**snapshot, "doc_id": doc_id}
+        _memory_docs[doc_id] = stored
+    return stored
 
 
 def get_existing_sessions(project, business_date):
@@ -439,4 +526,3 @@ def analyze_history(project, session, days):
         response["project10"] = {"entries": current_entries}
 
     return response
-
