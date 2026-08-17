@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 
 from history.session_history import (
     analyze_history,
+    analyze_average_history,
     get_storage_status,
     normalize_project,
     safe_days,
@@ -25,7 +26,10 @@ async def get_history(
     project: str = Query("project220"),
     session: int = Query(1),
     days: int = Query(7),
+    mode: str = Query("session"),
 ):
+    if str(mode).strip().lower() in {"average", "avg", "combined"}:
+        return await asyncio.to_thread(analyze_average_history, normalize_project(project), safe_days(days))
     return await asyncio.to_thread(analyze_history, normalize_project(project), safe_session(session), safe_days(days))
 
 

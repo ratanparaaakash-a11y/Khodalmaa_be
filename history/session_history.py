@@ -542,6 +542,145 @@ def build_break_today(snapshots):
     return breaks
 
 
+def combined_entry_candidates(project, docs):
+    session_total = len(docs)
+    grouped = {}
+
+    for doc in docs:
+        session = safe_session(doc.get("session"))
+        seen_in_session = set()
+        for entry in doc.get("entries", []):
+            key = entry_key(entry)
+            if key in seen_in_session:
+                continue
+            seen_in_session.add(key)
+
+            if key not in grouped:
+                grouped[key] = {
+                    "entry": copy.deepcopy(entry),
+                    "sessions": set(),
+                    "ranks": [],
+                }
+
+            grouped[key]["sessions"].add(session)
+            try:
+                grouped[key]["ranks"].append(float(entry.get("rank") or 999))
+            except (TypeError, ValueError):
+                grouped[key]["ranks"].append(999.0)
+
+    candidates = []
+    for group in grouped.values():
+        entry = group["entry"]
+        sessions = sorted(group["sessions"])
+        session_hits = len(sessions)
+        avg_rank = sum(group["ranks"]) / len(group["ranks"]) if group["ranks"] else 999.0
+        candidates.append({
+            **entry,
+            "session_hits": session_hits,
+            "session_total": session_total,
+            "average_score": round(session_hits / session_total, 3) if session_total else 0,
+            "average_label": f"{session_hits}/{session_total}" if session_total else "0/0",
+            "avg_rank": round(avg_rank, 2),
+            "source_sessions": sessions,
+        })
+
+    return candidates
+
+
+def combined_sort_key(entry):
+    return (
+        -int(entry.get("session_hits") or 0),
+        float(entry.get("avg_rank") or 999),
+        int(entry.get("row_index") or 999),
+        str(entry.get("number") or ""),
+    )
+
+
+def select_combined_project10_entries(candidates):
+    selected = sorted(candidates, key=combined_sort_key)[:PROJECT10_LOW_COUNT]
+    return [{**entry, "rank": index + 1} for index, entry in enumerate(selected)]
+
+
+def select_combined_project220_entries(candidates):
+    selected = []
+    for half_key, limit in [
+        ("first", PROJECT220_FIRST_HALF_LOW_COUNT),
+        ("second", PROJECT220_SECOND_HALF_LOW_COUNT),
+    ]:
+        for column in [display_column(col) for col in ALL_COLUMNS]:
+            column_entries = [
+                entry
+                for entry in candidates
+                if entry.get("half_key") == half_key and str(entry.get("column")) == column
+            ]
+            ranked = sorted(column_entries, key=combined_sort_key)[:limit]
+            selected.extend({**entry, "rank": index + 1} for index, entry in enumerate(ranked))
+    return selected
+
+
+def build_combined_snapshot(project, business_date, docs):
+    if not docs:
+        return None
+
+    candidates = combined_entry_candidates(project, docs)
+    if project == "project10":
+        entries = select_combined_project10_entries(candidates)
+    else:
+        entries = select_combined_project220_entries(candidates)
+
+    first_count = sum(1 for entry in entries if entry.get("half_key") == "first")
+    second_count = sum(1 for entry in entries if entry.get("half_key") == "second")
+    saved_values = [doc.get("saved_at") for doc in docs if doc.get("saved_at")]
+    saved_at = max(saved_values) if saved_values else get_now_iso()
+
+    return {
+        "project": project,
+        "business_date": business_date,
+        "session": "average",
+        "session_key": "Average",
+        "combined_sessions": len(docs),
+        "source_sessions": [safe_session(doc.get("session")) for doc in docs],
+        "saved_at": saved_at,
+        "entry_count": len(entries),
+        "first_half_count": first_count,
+        "second_half_count": second_count,
+        "entries": entries,
+    }
+
+
+def load_combined_snapshots(project, days):
+    snapshots = []
+    for business_date in date_range(days):
+        docs = []
+        for session in range(1, MAX_SESSION_PER_DAY + 1):
+            doc = load_doc(project, business_date, session)
+            if doc:
+                docs.append(doc)
+        snapshot = build_combined_snapshot(project, business_date, docs)
+        if snapshot:
+            snapshots.append(snapshot)
+    return snapshots
+
+
+def build_average_metrics(current_entries, break_today, latest):
+    session_total = int(latest.get("combined_sessions") or 0) if latest else 0
+    avg_hits = (
+        sum(float(entry.get("session_hits") or 0) for entry in current_entries) / len(current_entries)
+        if current_entries
+        else 0
+    )
+
+    return {
+        "total_lows": len(current_entries),
+        "running": sum(1 for entry in current_entries if entry.get("days_running", 0) > 1),
+        "break_today": len(break_today),
+        "combined_sessions": session_total,
+        "session_label": f"{session_total}/{MAX_SESSION_PER_DAY}",
+        "average_hits": round(avg_hits, 1),
+        "average_label": f"{avg_hits:.1f}/{session_total}" if session_total else "0/0",
+    }
+
+
 def group_project220(entries):
     grouped = {
         "first_half": {"total": 0, "columns": []},
@@ -591,6 +730,52 @@ def analyze_history(project, session, days):
         response["top_running"] = sorted(
             current_entries,
             key=lambda entry: (entry.get("days_running", 0), entry.get("range_count", 0)),
+            reverse=True,
+        )[:12]
+    else:
+        response["project10"] = {"entries": current_entries}
+
+    return response
+
+
+def analyze_average_history(project, days):
+    normalized_project = normalize_project(project)
+    snapshots = load_combined_snapshots(normalized_project, safe_days(days))
+    latest = snapshots[0] if snapshots else None
+    current_entries = with_history_stats(latest.get("entries", []) if latest else [], snapshots)
+    break_today = build_break_today(snapshots)
+
+    response = {
+        "project": normalized_project,
+        "mode": "average",
+        "session": "average",
+        "session_key": "Average",
+        "days": safe_days(days),
+        "snapshots_found": len(snapshots),
+        "latest_snapshot": {
+            "business_date": latest.get("business_date"),
+            "session": "average",
+            "session_key": "Average",
+            "entry_count": latest.get("entry_count"),
+            "combined_sessions": latest.get("combined_sessions"),
+            "source_sessions": latest.get("source_sessions"),
+            "saved_at": latest.get("saved_at"),
+        } if latest else None,
+        "metrics": build_average_metrics(current_entries, break_today, latest),
+        "entries": current_entries,
+        "break_today": break_today,
+    }
+
+    if normalized_project == "project220":
+        response["project220"] = group_project220(current_entries)
+        response["top_running"] = sorted(
+            current_entries,
+            key=lambda entry: (
+                entry.get("days_running", 0),
+                entry.get("session_hits", 0),
+                entry.get("average_score", 0),
+                entry.get("range_count", 0),
+            ),
             reverse=True,
         )[:12]
     else:
