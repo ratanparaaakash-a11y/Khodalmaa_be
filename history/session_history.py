@@ -36,6 +36,7 @@ _memory_docs = {}
 _cached_token = None
 _cached_token_until = 0
 _firestore_client = None
+_firestore_admin_disabled_until = 0
 _firestore_disabled_until = 0
 _last_firestore_error = None
 _file_store_dir = Path(os.getenv("HISTORY_STORE_DIR") or Path(tempfile.gettempdir()) / "khodalmaa_history")
@@ -176,6 +177,17 @@ def firestore_is_disabled():
     return time.time() < _firestore_disabled_until
 
 
+def firestore_admin_is_disabled():
+    return time.time() < _firestore_admin_disabled_until
+
+
+def disable_firestore_admin_temporarily(error, context="admin"):
+    global _firestore_admin_disabled_until, _last_firestore_error
+    _firestore_admin_disabled_until = time.time() + 5 * 60
+    _last_firestore_error = f"{context}: {summarize_firestore_error(error)}"
+    print(f"History Firestore admin temporarily disabled: {_last_firestore_error}")
+
+
 def summarize_firestore_error(error):
     if isinstance(error, httpx.HTTPStatusError) and error.response is not None:
         try:
@@ -208,7 +220,7 @@ def get_firestore_client():
 
 
 def load_firestore_doc_admin(doc_id):
-    doc = get_firestore_client().collection(COLLECTION_NAME).document(doc_id).get()
+    doc = get_firestore_client().collection(COLLECTION_NAME).document(doc_id).get(timeout=3)
     if not doc.exists:
         return None
     return doc.to_dict()
@@ -216,7 +228,7 @@ def load_firestore_doc_admin(doc_id):
 
 def load_firestore_docs_admin():
     docs = []
-    for doc in get_firestore_client().collection(COLLECTION_NAME).stream():
+    for doc in get_firestore_client().collection(COLLECTION_NAME).stream(timeout=4):
         data = doc.to_dict()
         if isinstance(data, dict):
             docs.append(data)
@@ -224,7 +236,7 @@ def load_firestore_docs_admin():
 
 
 def save_firestore_doc_admin(doc_id, data):
-    get_firestore_client().collection(COLLECTION_NAME).document(doc_id).set(data)
+    get_firestore_client().collection(COLLECTION_NAME).document(doc_id).set(data, timeout=3)
 
 
 def parse_arrow_entry(entry):
@@ -413,10 +425,12 @@ def load_doc(project, business_date, session):
     if firestore_is_disabled():
         return None
 
-    try:
-        return load_firestore_doc_admin(doc_id)
-    except Exception as error:
-        print(f"History Firestore admin read fallback for {doc_id}: {error}")
+    if not firestore_admin_is_disabled():
+        try:
+            return load_firestore_doc_admin(doc_id)
+        except Exception as error:
+            print(f"History Firestore admin read fallback for {doc_id}: {error}")
+            disable_firestore_admin_temporarily(error, "admin read")
 
     try:
         response = httpx.get(
@@ -454,10 +468,12 @@ def load_firestore_docs():
     if firestore_is_disabled():
         return []
 
-    try:
-        return load_firestore_docs_admin()
-    except Exception as error:
-        print(f"History Firestore admin list fallback: {error}")
+    if not firestore_admin_is_disabled():
+        try:
+            return load_firestore_docs_admin()
+        except Exception as error:
+            print(f"History Firestore admin list fallback: {error}")
+            disable_firestore_admin_temporarily(error, "admin list")
 
     docs = []
     page_token = None
@@ -518,11 +534,13 @@ def save_doc(snapshot):
     if firestore_is_disabled():
         return stored
 
-    try:
-        save_firestore_doc_admin(doc_id, stored)
-        return stored
-    except Exception as error:
-        print(f"History Firestore admin write fallback for {doc_id}: {error}")
+    if not firestore_admin_is_disabled():
+        try:
+            save_firestore_doc_admin(doc_id, stored)
+            return stored
+        except Exception as error:
+            print(f"History Firestore admin write fallback for {doc_id}: {error}")
+            disable_firestore_admin_temporarily(error, "admin write")
 
     try:
         response = httpx.patch(
@@ -548,6 +566,7 @@ def get_storage_status():
         "memory_docs": len(_memory_docs),
         "file_docs": file_docs,
         "firestore_disabled_seconds": max(0, int(_firestore_disabled_until - time.time())),
+        "firestore_admin_disabled_seconds": max(0, int(_firestore_admin_disabled_until - time.time())),
         "firestore_last_error": _last_firestore_error,
     }
 
