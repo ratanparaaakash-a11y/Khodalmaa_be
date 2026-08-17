@@ -35,7 +35,9 @@ _session_number_cache = {}
 _memory_docs = {}
 _cached_token = None
 _cached_token_until = 0
+_firestore_client = None
 _firestore_disabled_until = 0
+_last_firestore_error = None
 _file_store_dir = Path(os.getenv("HISTORY_STORE_DIR") or Path(tempfile.gettempdir()) / "khodalmaa_history")
 
 
@@ -174,10 +176,55 @@ def firestore_is_disabled():
     return time.time() < _firestore_disabled_until
 
 
-def disable_firestore_temporarily(error):
-    global _firestore_disabled_until
+def summarize_firestore_error(error):
+    if isinstance(error, httpx.HTTPStatusError) and error.response is not None:
+        try:
+            detail = error.response.json().get("error", {})
+            message = detail.get("message") or error.response.text
+            status_text = detail.get("status") or error.response.reason_phrase
+            return f"{error.response.status_code} {status_text}: {message}"[:500]
+        except Exception:
+            return f"{error.response.status_code}: {error.response.text}"[:500]
+    return f"{type(error).__name__}: {error}"[:500]
+
+
+def disable_firestore_temporarily(error, context="Firestore"):
+    global _firestore_disabled_until, _last_firestore_error
     _firestore_disabled_until = time.time() + 5 * 60
-    print(f"History Firestore temporarily disabled: {error}")
+    _last_firestore_error = f"{context}: {summarize_firestore_error(error)}"
+    print(f"History Firestore temporarily disabled: {_last_firestore_error}")
+
+
+def get_firestore_client():
+    global _firestore_client
+    if _firestore_client is not None:
+        return _firestore_client
+
+    from firebase.config import firebase_app
+    from firebase_admin import firestore
+
+    _firestore_client = firestore.client(app=firebase_app)
+    return _firestore_client
+
+
+def load_firestore_doc_admin(doc_id):
+    doc = get_firestore_client().collection(COLLECTION_NAME).document(doc_id).get()
+    if not doc.exists:
+        return None
+    return doc.to_dict()
+
+
+def load_firestore_docs_admin():
+    docs = []
+    for doc in get_firestore_client().collection(COLLECTION_NAME).stream():
+        data = doc.to_dict()
+        if isinstance(data, dict):
+            docs.append(data)
+    return docs
+
+
+def save_firestore_doc_admin(doc_id, data):
+    get_firestore_client().collection(COLLECTION_NAME).document(doc_id).set(data)
 
 
 def parse_arrow_entry(entry):
@@ -367,6 +414,11 @@ def load_doc(project, business_date, session):
         return None
 
     try:
+        return load_firestore_doc_admin(doc_id)
+    except Exception as error:
+        print(f"History Firestore admin read fallback for {doc_id}: {error}")
+
+    try:
         response = httpx.get(
             firestore_url(doc_id),
             headers={"Authorization": f"Bearer {get_access_token()}"},
@@ -378,7 +430,7 @@ def load_doc(project, business_date, session):
         return plain_fields(response.json().get("fields", {}))
     except Exception as error:
         print(f"History Firestore read fallback for {doc_id}: {error}")
-        disable_firestore_temporarily(error)
+        disable_firestore_temporarily(error, "read")
     return None
 
 
@@ -401,6 +453,11 @@ def load_file_docs():
 def load_firestore_docs():
     if firestore_is_disabled():
         return []
+
+    try:
+        return load_firestore_docs_admin()
+    except Exception as error:
+        print(f"History Firestore admin list fallback: {error}")
 
     docs = []
     page_token = None
@@ -425,7 +482,7 @@ def load_firestore_docs():
                 break
     except Exception as error:
         print(f"History Firestore list fallback: {error}")
-        disable_firestore_temporarily(error)
+        disable_firestore_temporarily(error, "list")
     return docs
 
 
@@ -462,6 +519,12 @@ def save_doc(snapshot):
         return stored
 
     try:
+        save_firestore_doc_admin(doc_id, stored)
+        return stored
+    except Exception as error:
+        print(f"History Firestore admin write fallback for {doc_id}: {error}")
+
+    try:
         response = httpx.patch(
             firestore_url(doc_id),
             headers={"Authorization": f"Bearer {get_access_token()}"},
@@ -471,7 +534,7 @@ def save_doc(snapshot):
         response.raise_for_status()
     except Exception as error:
         print(f"History Firestore write fallback for {doc_id}: {error}")
-        disable_firestore_temporarily(error)
+        disable_firestore_temporarily(error, "write")
     return stored
 
 
@@ -485,6 +548,7 @@ def get_storage_status():
         "memory_docs": len(_memory_docs),
         "file_docs": file_docs,
         "firestore_disabled_seconds": max(0, int(_firestore_disabled_until - time.time())),
+        "firestore_last_error": _last_firestore_error,
     }
 
 
