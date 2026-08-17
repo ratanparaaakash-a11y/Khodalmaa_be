@@ -566,6 +566,7 @@ def get_storage_status():
     return {
         "memory_docs": len(_memory_docs),
         "file_docs": file_docs,
+        "firestore_admin_enabled": USE_FIRESTORE_ADMIN,
         "firestore_disabled_seconds": max(0, int(_firestore_disabled_until - time.time())),
         "firestore_admin_disabled_seconds": max(0, int(_firestore_admin_disabled_until - time.time())),
         "firestore_last_error": _last_firestore_error,
