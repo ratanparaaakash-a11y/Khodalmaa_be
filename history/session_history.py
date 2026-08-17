@@ -160,6 +160,16 @@ def firestore_url(doc_id):
     )
 
 
+def firestore_collection_url():
+    from constant import service_account_key
+
+    project_id = service_account_key.get("project_id")
+    return (
+        f"https://firestore.googleapis.com/v1/projects/{project_id}"
+        f"/databases/(default)/documents/{COLLECTION_NAME}"
+    )
+
+
 def firestore_is_disabled():
     return time.time() < _firestore_disabled_until
 
@@ -372,6 +382,76 @@ def load_doc(project, business_date, session):
     return None
 
 
+def load_file_docs():
+    docs = []
+    try:
+        if not _file_store_dir.exists():
+            return docs
+        for path in _file_store_dir.glob("*.json"):
+            try:
+                with path.open("r", encoding="utf-8") as file:
+                    docs.append(json.load(file))
+            except Exception as error:
+                print(f"History file list read fallback failed for {path.name}: {error}")
+    except Exception as error:
+        print(f"History file list fallback failed: {error}")
+    return docs
+
+
+def load_firestore_docs():
+    if firestore_is_disabled():
+        return []
+
+    docs = []
+    page_token = None
+    try:
+        for _ in range(5):
+            params = {"pageSize": 300}
+            if page_token:
+                params["pageToken"] = page_token
+            response = httpx.get(
+                firestore_collection_url(),
+                headers={"Authorization": f"Bearer {get_access_token()}"},
+                params=params,
+                timeout=4,
+            )
+            if response.status_code == 404:
+                return docs
+            response.raise_for_status()
+            payload = response.json()
+            docs.extend(plain_fields(doc.get("fields", {})) for doc in payload.get("documents", []))
+            page_token = payload.get("nextPageToken")
+            if not page_token:
+                break
+    except Exception as error:
+        print(f"History Firestore list fallback: {error}")
+        disable_firestore_temporarily(error)
+    return docs
+
+
+def load_all_docs(project):
+    normalized_project = normalize_project(project)
+    by_id = {}
+
+    for doc in [*_memory_docs.values(), *load_file_docs(), *load_firestore_docs()]:
+        if not isinstance(doc, dict):
+            continue
+        if doc.get("project") != normalized_project:
+            continue
+        if not isinstance(doc.get("entries"), list) or not doc.get("entries"):
+            continue
+
+        session = safe_session(doc.get("session"))
+        business_date = str(doc.get("business_date") or "")
+        doc_id = doc.get("doc_id") or get_doc_id(normalized_project, business_date, session)
+        by_id[doc_id] = {**doc, "doc_id": doc_id, "session": session}
+
+    return sorted(
+        by_id.values(),
+        key=lambda doc: (str(doc.get("business_date") or ""), int(doc.get("session") or 0)),
+    )
+
+
 def save_doc(snapshot):
     doc_id = get_doc_id(snapshot["project"], snapshot["business_date"], snapshot["session"])
     stored = {**snapshot, "doc_id": doc_id, "updated_at": get_now_iso()}
@@ -578,6 +658,7 @@ def combined_entry_candidates(project, docs):
 
     for doc in docs:
         session = safe_session(doc.get("session"))
+        doc_ref = doc.get("doc_id") or f"{doc.get('business_date')}-s{session}-{project}"
         seen_in_session = set()
         for entry in doc.get("entries", []):
             key = entry_key(entry)
@@ -588,11 +669,15 @@ def combined_entry_candidates(project, docs):
             if key not in grouped:
                 grouped[key] = {
                     "entry": copy.deepcopy(entry),
-                    "sessions": set(),
+                    "hit_count": 0,
+                    "sessions": [],
+                    "doc_refs": [],
                     "ranks": [],
                 }
 
-            grouped[key]["sessions"].add(session)
+            grouped[key]["hit_count"] += 1
+            grouped[key]["sessions"].append(session)
+            grouped[key]["doc_refs"].append(doc_ref)
             try:
                 grouped[key]["ranks"].append(float(entry.get("rank") or 999))
             except (TypeError, ValueError):
@@ -601,17 +686,19 @@ def combined_entry_candidates(project, docs):
     candidates = []
     for group in grouped.values():
         entry = group["entry"]
-        sessions = sorted(group["sessions"])
-        session_hits = len(sessions)
+        session_hits = group["hit_count"]
         avg_rank = sum(group["ranks"]) / len(group["ranks"]) if group["ranks"] else 999.0
+        average_percent = round((session_hits / session_total) * 100) if session_total else 0
         candidates.append({
             **entry,
             "session_hits": session_hits,
             "session_total": session_total,
             "average_score": round(session_hits / session_total, 3) if session_total else 0,
-            "average_label": f"{session_hits}/{session_total}" if session_total else "0/0",
+            "average_percent": average_percent,
+            "average_label": f"{average_percent}%",
             "avg_rank": round(avg_rank, 2),
-            "source_sessions": sessions,
+            "source_sessions": group["sessions"],
+            "source_docs": group["doc_refs"],
         })
 
     return candidates
@@ -619,7 +706,7 @@ def combined_entry_candidates(project, docs):
 
 def combined_sort_key(entry):
     return (
-        -int(entry.get("session_hits") or 0),
+        -float(entry.get("average_score") or 0),
         float(entry.get("avg_rank") or 999),
         int(entry.get("row_index") or 999),
         str(entry.get("number") or ""),
@@ -694,20 +781,22 @@ def load_combined_snapshots(project, days):
 
 def build_average_metrics(current_entries, break_today, latest):
     session_total = int(latest.get("combined_sessions") or 0) if latest else 0
-    avg_hits = (
-        sum(float(entry.get("session_hits") or 0) for entry in current_entries) / len(current_entries)
+    average_percent = (
+        sum(float(entry.get("average_percent") or 0) for entry in current_entries) / len(current_entries)
         if current_entries
         else 0
     )
+    strong_match = max([int(entry.get("average_percent") or 0) for entry in current_entries], default=0)
 
     return {
         "total_lows": len(current_entries),
         "running": sum(1 for entry in current_entries if entry.get("days_running", 0) > 1),
         "break_today": len(break_today),
         "combined_sessions": session_total,
-        "session_label": f"{session_total}/{MAX_SESSION_PER_DAY}",
-        "average_hits": round(avg_hits, 1),
-        "average_label": f"{avg_hits:.1f}/{session_total}" if session_total else "0/0",
+        "strong_match": strong_match,
+        "strong_match_label": f"{strong_match}%",
+        "average_percent": round(average_percent),
+        "average_label": f"{round(average_percent)}%",
     }
 
 
@@ -770,18 +859,19 @@ def analyze_history(project, session, days):
 
 def analyze_average_history(project, days):
     normalized_project = normalize_project(project)
-    snapshots = load_combined_snapshots(normalized_project, safe_days(days))
-    latest = snapshots[0] if snapshots else None
-    current_entries = with_history_stats(latest.get("entries", []) if latest else [], snapshots)
-    break_today = build_break_today(snapshots)
+    source_docs = load_all_docs(normalized_project)
+    latest = build_combined_snapshot(normalized_project, "all", source_docs)
+    current_entries = latest.get("entries", []) if latest else []
+    break_today = []
+    source_dates = sorted({str(doc.get("business_date")) for doc in source_docs if doc.get("business_date")})
 
     response = {
         "project": normalized_project,
         "mode": "average",
         "session": "average",
         "session_key": "Average",
-        "days": safe_days(days),
-        "snapshots_found": len(snapshots),
+        "days": "all",
+        "snapshots_found": len(source_docs),
         "latest_snapshot": {
             "business_date": latest.get("business_date"),
             "session": "average",
@@ -789,6 +879,9 @@ def analyze_average_history(project, days):
             "entry_count": latest.get("entry_count"),
             "combined_sessions": latest.get("combined_sessions"),
             "source_sessions": latest.get("source_sessions"),
+            "source_days": len(source_dates),
+            "first_date": source_dates[0] if source_dates else None,
+            "last_date": source_dates[-1] if source_dates else None,
             "saved_at": latest.get("saved_at"),
         } if latest else None,
         "metrics": build_average_metrics(current_entries, break_today, latest),
@@ -801,10 +894,8 @@ def analyze_average_history(project, days):
         response["top_running"] = sorted(
             current_entries,
             key=lambda entry: (
-                entry.get("days_running", 0),
-                entry.get("session_hits", 0),
                 entry.get("average_score", 0),
-                entry.get("range_count", 0),
+                -float(entry.get("avg_rank") or 999),
             ),
             reverse=True,
         )[:12]
