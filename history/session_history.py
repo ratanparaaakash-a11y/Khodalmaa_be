@@ -456,6 +456,36 @@ def save_session_snapshot(project, data, session_started_at=None, source="auto",
     }
 
 
+def save_built_session_snapshot(project, business_date, session, entries, saved_at=None, source="restore"):
+    normalized_project = normalize_project(project)
+    safe_entries = [copy.deepcopy(entry) for entry in entries if isinstance(entry, dict)]
+    session_number = safe_session(session)
+    first_count = sum(1 for entry in safe_entries if entry.get("half_key") == "first")
+    second_count = sum(1 for entry in safe_entries if entry.get("half_key") == "second")
+    snapshot = {
+        "project": normalized_project,
+        "business_date": str(business_date or get_business_date()),
+        "session": session_number,
+        "session_key": f"S{session_number}",
+        "session_started_at": 0,
+        "source": source,
+        "saved_at": saved_at or get_now_iso(),
+        "entry_count": len(safe_entries),
+        "first_half_count": first_count,
+        "second_half_count": second_count,
+        "entries": safe_entries,
+    }
+    saved = save_doc(snapshot)
+    return {
+        "project": normalized_project,
+        "saved": True,
+        "business_date": saved["business_date"],
+        "session": saved["session"],
+        "entry_count": saved["entry_count"],
+        "doc_id": saved["doc_id"],
+    }
+
+
 async def delayed_finalize(project, data_ref, session_started_at, token):
     try:
         await asyncio.sleep(AUTO_FINALIZE_SECONDS)

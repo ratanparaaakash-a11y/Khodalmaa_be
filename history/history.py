@@ -9,6 +9,7 @@ from history.session_history import (
     normalize_project,
     safe_days,
     safe_session,
+    save_built_session_snapshot,
     save_session_snapshot,
 )
 
@@ -82,5 +83,20 @@ async def snapshot_payload(req: Request):
         body.get("session_started_at"),
         body.get("source") or "import",
         body.get("session"),
+    )
+    return {"status": "success", "result": result}
+
+
+@HistoryRouter.post("/history/snapshot-built")
+async def snapshot_built(req: Request):
+    body = await req.json()
+    result = await asyncio.to_thread(
+        save_built_session_snapshot,
+        body.get("project"),
+        body.get("business_date"),
+        body.get("session"),
+        body.get("entries") or [],
+        body.get("saved_at"),
+        body.get("source") or "restore",
     )
     return {"status": "success", "result": result}
