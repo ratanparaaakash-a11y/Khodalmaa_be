@@ -29,6 +29,7 @@ BUSINESS_DAY_RESET_HOUR = 4
 AUTO_FINALIZE_SECONDS = 90
 MAX_SESSION_PER_DAY = 2
 INDIA_TZ = timezone(timedelta(hours=5, minutes=30))
+USE_FIRESTORE_ADMIN = os.getenv("HISTORY_FIRESTORE_ADMIN") == "1"
 
 _finalize_tasks = {}
 _session_number_cache = {}
@@ -178,7 +179,7 @@ def firestore_is_disabled():
 
 
 def firestore_admin_is_disabled():
-    return time.time() < _firestore_admin_disabled_until
+    return not USE_FIRESTORE_ADMIN or time.time() < _firestore_admin_disabled_until
 
 
 def disable_firestore_admin_temporarily(error, context="admin"):
