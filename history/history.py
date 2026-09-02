@@ -5,11 +5,13 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from history.session_history import (
     analyze_history,
     analyze_average_history,
+    analyze_project220_sent_low_report,
     get_storage_status,
     normalize_project,
     safe_days,
     safe_session,
     save_built_session_snapshot,
+    save_project220_sent_low_snapshot,
     save_session_snapshot,
 )
 
@@ -100,3 +102,32 @@ async def snapshot_built(req: Request):
         body.get("source") or "restore",
     )
     return {"status": "success", "result": result}
+
+
+@HistoryRouter.post("/project220/sent-low-snapshot")
+async def project220_sent_low_snapshot(req: Request):
+    body = await req.json()
+    from project1 import project1 as p220_module
+
+    result = await asyncio.to_thread(
+        save_project220_sent_low_snapshot,
+        body.get("button"),
+        body.get("entries") or [],
+        p220_module.project1_session_started_at,
+    )
+    return {"status": "success", "result": result}
+
+
+@HistoryRouter.get("/project220/sent-low-calculation")
+async def project220_sent_low_calculation(
+    business_date: str | None = Query(None),
+    session: int | None = Query(None),
+):
+    from project1 import project1 as p220_module
+
+    return await asyncio.to_thread(
+        analyze_project220_sent_low_report,
+        p220_module.latest_project1_data,
+        business_date,
+        session,
+    )

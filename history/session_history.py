@@ -25,6 +25,7 @@ from history.rules import (
 
 
 COLLECTION_NAME = "session_low_history"
+PROJECT220_SENT_LOW_PROJECT = "project220_sent_low"
 BUSINESS_DAY_RESET_HOUR = 4
 AUTO_FINALIZE_SECONDS = 90
 MAX_SESSION_PER_DAY = 2
@@ -529,6 +530,11 @@ def load_all_docs(project):
 def save_doc(snapshot):
     doc_id = get_doc_id(snapshot["project"], snapshot["business_date"], snapshot["session"])
     stored = {**snapshot, "doc_id": doc_id, "updated_at": get_now_iso()}
+    return save_raw_doc(doc_id, stored)
+
+
+def save_raw_doc(doc_id, data):
+    stored = {**data, "doc_id": doc_id, "updated_at": get_now_iso()}
     _memory_docs[doc_id] = stored
     save_file_doc(doc_id, stored)
 
@@ -555,6 +561,20 @@ def save_doc(snapshot):
         print(f"History Firestore write fallback for {doc_id}: {error}")
         disable_firestore_temporarily(error, "write")
     return stored
+
+
+def load_docs_by_project_name(project_name):
+    by_id = {}
+    for doc in [*_memory_docs.values(), *load_file_docs(), *load_firestore_docs()]:
+        if not isinstance(doc, dict):
+            continue
+        if doc.get("project") != project_name:
+            continue
+        doc_id = doc.get("doc_id")
+        if not doc_id:
+            continue
+        by_id[doc_id] = doc
+    return list(by_id.values())
 
 
 def get_storage_status():
@@ -648,6 +668,170 @@ def save_built_session_snapshot(project, business_date, session, entries, saved_
         "session": saved["session"],
         "entry_count": saved["entry_count"],
         "doc_id": saved["doc_id"],
+    }
+
+
+def normalize_sent_low_entry(entry):
+    if not isinstance(entry, dict):
+        return None
+
+    parsed = parse_arrow_entry(entry.get("entry"))
+    try:
+        number = int(str(entry.get("number") or (parsed[0] if parsed else "")).strip())
+    except (TypeError, ValueError):
+        return None
+
+    try:
+        amount = float(entry.get("amount") if entry.get("amount") is not None else parsed[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+    raw_column = entry.get("column")
+    try:
+        column = 10 if str(raw_column) == "0" else int(raw_column)
+    except (TypeError, ValueError):
+        return None
+
+    half_key = "second" if str(entry.get("half") or "").lower().startswith("second") else "first"
+    try:
+        rank = int(entry.get("rank") or 0)
+    except (TypeError, ValueError):
+        rank = 0
+
+    display_number = display_project220_number(number)
+    display_col = display_column(column)
+    return {
+        "number": display_number,
+        "column": display_col,
+        "half_key": half_key,
+        "half": "Second Half" if half_key == "second" else "First Half",
+        "rank": rank,
+        "amount": amount,
+        "entry": f"{display_number}->{amount:g}",
+        "key": f"project220-sent:{half_key}:{display_col}:{display_number}",
+    }
+
+
+def save_project220_sent_low_snapshot(button, entries, session_started_at=None):
+    safe_entries = [
+        item for item in (normalize_sent_low_entry(entry) for entry in (entries or []))
+        if item is not None
+    ]
+    if not safe_entries:
+        return {"saved": False, "reason": "No sent low entries"}
+
+    business_date = get_business_date()
+    session = get_session_number("project220", business_date, session_started_at, None)
+    now_epoch_ms = int(time.time() * 1000)
+    doc_id = f"{business_date}-s{session}-project220-sent-low-{now_epoch_ms}"
+    button_key = "second" if str(button or "").lower().startswith("second") else "first"
+    snapshot = {
+        "project": PROJECT220_SENT_LOW_PROJECT,
+        "business_date": business_date,
+        "session": session,
+        "session_key": f"S{session}",
+        "session_started_at": float(session_started_at or time.time()),
+        "button": button_key,
+        "button_label": "3 Low Second" if button_key == "second" else "4 Low First",
+        "sent_at": get_now_iso(),
+        "sent_at_epoch_ms": now_epoch_ms,
+        "entry_count": len(safe_entries),
+        "entries": safe_entries,
+    }
+    saved = save_raw_doc(doc_id, snapshot)
+    print(f"Saved project220 sent-low snapshot {doc_id}: {len(safe_entries)} entries")
+    return {
+        "saved": True,
+        "doc_id": saved["doc_id"],
+        "business_date": saved["business_date"],
+        "session": saved["session"],
+        "button": saved["button"],
+        "entry_count": saved["entry_count"],
+    }
+
+
+def load_project220_sent_low_snapshots(limit=20, business_date=None, session=None):
+    docs = []
+    for doc in load_docs_by_project_name(PROJECT220_SENT_LOW_PROJECT):
+        if business_date and doc.get("business_date") != business_date:
+            continue
+        if session and safe_session(doc.get("session")) != safe_session(session):
+            continue
+        docs.append(doc)
+
+    return sorted(
+        docs,
+        key=lambda doc: int(doc.get("sent_at_epoch_ms") or 0),
+        reverse=True,
+    )[:max(1, min(100, int(limit or 20)))]
+
+
+def find_project220_current_amount(summed, entry):
+    column = 10 if str(entry.get("column")) == "0" else int(entry.get("column") or 0)
+    target_number = 0 if str(entry.get("number")) == "000" else int(entry.get("number") or 0)
+    for item in summed.get(column, []):
+        if int(item.get("number") or -1) == target_number:
+            return float(item.get("amount") or 0)
+    return 0.0
+
+
+def analyze_project220_sent_low_report(current_data, business_date=None, session=None):
+    snapshots = load_project220_sent_low_snapshots(
+        limit=1,
+        business_date=business_date,
+        session=session,
+    )
+    if not snapshots:
+        return {"status": "empty", "reason": "No sent low snapshot saved yet"}
+
+    latest = snapshots[0]
+    if not current_data:
+        return {
+            "status": "no_current_data",
+            "reason": "No current project220 live data available",
+            "latest_snapshot": {
+                "doc_id": latest.get("doc_id"),
+                "button_label": latest.get("button_label"),
+                "sent_at": latest.get("sent_at"),
+                "entry_count": latest.get("entry_count"),
+            },
+        }
+
+    summed = build_project220_summed(current_data)
+    report_entries = []
+    for entry in latest.get("entries", []):
+        sent_amount = float(entry.get("amount") or 0)
+        current_amount = find_project220_current_amount(summed, entry)
+        report_entries.append({
+            **entry,
+            "sent_amount": sent_amount,
+            "current_amount": current_amount,
+            "increase": current_amount - sent_amount,
+        })
+
+    sent_total = sum(entry["sent_amount"] for entry in report_entries)
+    current_total = sum(entry["current_amount"] for entry in report_entries)
+    increase_total = current_total - sent_total
+
+    return {
+        "status": "success",
+        "latest_snapshot": {
+            "doc_id": latest.get("doc_id"),
+            "business_date": latest.get("business_date"),
+            "session": latest.get("session"),
+            "button": latest.get("button"),
+            "button_label": latest.get("button_label"),
+            "sent_at": latest.get("sent_at"),
+            "entry_count": latest.get("entry_count"),
+        },
+        "totals": {
+            "sent_amount": sent_total,
+            "current_amount": current_total,
+            "increase": increase_total,
+            "increased_count": sum(1 for entry in report_entries if entry["increase"] > 0),
+            "same_or_down_count": sum(1 for entry in report_entries if entry["increase"] <= 0),
+        },
+        "entries": report_entries,
     }
 
 
