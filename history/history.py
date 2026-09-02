@@ -1,4 +1,5 @@
 import asyncio
+from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
@@ -120,8 +121,8 @@ async def project220_sent_low_snapshot(req: Request):
 
 @HistoryRouter.get("/project220/sent-low-calculation")
 async def project220_sent_low_calculation(
-    business_date: str | None = Query(None),
-    session: int | None = Query(None),
+    business_date: Optional[str] = Query(None),
+    session: Optional[int] = Query(None),
 ):
     from project1 import project1 as p220_module
 
