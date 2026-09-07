@@ -3,6 +3,7 @@ import copy
 import json
 import os
 import tempfile
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -41,6 +42,10 @@ _firestore_client = None
 _firestore_admin_disabled_until = 0
 _firestore_disabled_until = 0
 _last_firestore_error = None
+_last_firestore_success_at = None
+_pending_cloud_docs = {}
+_cloud_reconciled = False
+_storage_lock = threading.RLock()
 _file_store_dir = Path(os.getenv("HISTORY_STORE_DIR") or Path(tempfile.gettempdir()) / "khodalmaa_history")
 
 
@@ -207,6 +212,33 @@ def disable_firestore_temporarily(error, context="Firestore"):
     _firestore_disabled_until = time.time() + 5 * 60
     _last_firestore_error = f"{context}: {summarize_firestore_error(error)}"
     print(f"History Firestore temporarily disabled: {_last_firestore_error}")
+
+
+def mark_firestore_success():
+    global _last_firestore_error, _last_firestore_success_at, _firestore_disabled_until
+    _last_firestore_error = None
+    _last_firestore_success_at = get_now_iso()
+    _firestore_disabled_until = 0
+
+
+def document_version(doc):
+    value = doc.get("updated_at") or doc.get("saved_at")
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=timezone.utc).timestamp() if parsed.tzinfo is None else parsed.timestamp()
+    except (TypeError, ValueError):
+        return 0
+
+
+def remember_newest(by_id, doc_id, doc):
+    previous = by_id.get(doc_id)
+    if previous is None or document_version(doc) > document_version(previous):
+        by_id[doc_id] = doc
+
+
+def memory_docs_snapshot():
+    with _storage_lock:
+        return list(_memory_docs.values())
 
 
 def get_firestore_client():
@@ -429,7 +461,9 @@ def load_doc(project, business_date, session):
 
     if not firestore_admin_is_disabled():
         try:
-            return load_firestore_doc_admin(doc_id)
+            doc = load_firestore_doc_admin(doc_id)
+            mark_firestore_success()
+            return doc
         except Exception as error:
             print(f"History Firestore admin read fallback for {doc_id}: {error}")
             disable_firestore_admin_temporarily(error, "admin read")
@@ -443,6 +477,7 @@ def load_doc(project, business_date, session):
         if response.status_code == 404:
             return None
         response.raise_for_status()
+        mark_firestore_success()
         return plain_fields(response.json().get("fields", {}))
     except Exception as error:
         print(f"History Firestore read fallback for {doc_id}: {error}")
@@ -472,7 +507,9 @@ def load_firestore_docs():
 
     if not firestore_admin_is_disabled():
         try:
-            return load_firestore_docs_admin()
+            docs = load_firestore_docs_admin()
+            mark_firestore_success()
+            return docs
         except Exception as error:
             print(f"History Firestore admin list fallback: {error}")
             disable_firestore_admin_temporarily(error, "admin list")
@@ -480,7 +517,7 @@ def load_firestore_docs():
     docs = []
     page_token = None
     try:
-        for _ in range(5):
+        while True:
             params = {"pageSize": 300}
             if page_token:
                 params["pageToken"] = page_token
@@ -490,14 +527,13 @@ def load_firestore_docs():
                 params=params,
                 timeout=4,
             )
-            if response.status_code == 404:
-                return docs
             response.raise_for_status()
             payload = response.json()
             docs.extend(plain_fields(doc.get("fields", {})) for doc in payload.get("documents", []))
             page_token = payload.get("nextPageToken")
             if not page_token:
                 break
+        mark_firestore_success()
     except Exception as error:
         print(f"History Firestore list fallback: {error}")
         disable_firestore_temporarily(error, "list")
@@ -508,7 +544,7 @@ def load_all_docs(project):
     normalized_project = normalize_project(project)
     by_id = {}
 
-    for doc in [*_memory_docs.values(), *load_file_docs(), *load_firestore_docs()]:
+    for doc in [*memory_docs_snapshot(), *load_file_docs(), *load_firestore_docs()]:
         if not isinstance(doc, dict):
             continue
         if doc.get("project") != normalized_project:
@@ -519,7 +555,7 @@ def load_all_docs(project):
         session = safe_session(doc.get("session"))
         business_date = str(doc.get("business_date") or "")
         doc_id = doc.get("doc_id") or get_doc_id(normalized_project, business_date, session)
-        by_id[doc_id] = {**doc, "doc_id": doc_id, "session": session}
+        remember_newest(by_id, doc_id, {**doc, "doc_id": doc_id, "session": session})
 
     return sorted(
         by_id.values(),
@@ -535,16 +571,26 @@ def save_doc(snapshot):
 
 def save_raw_doc(doc_id, data):
     stored = {**data, "doc_id": doc_id, "updated_at": get_now_iso()}
-    _memory_docs[doc_id] = stored
-    save_file_doc(doc_id, stored)
+    with _storage_lock:
+        _memory_docs[doc_id] = stored
+        save_file_doc(doc_id, stored)
+        # The snapshot file is the durable retry source after a process restart.
+        _pending_cloud_docs[doc_id] = stored
+        if write_cloud_doc(doc_id, stored):
+            _pending_cloud_docs.pop(doc_id, None)
+    return stored
+
+
+def write_cloud_doc(doc_id, stored):
 
     if firestore_is_disabled():
-        return stored
+        return False
 
     if not firestore_admin_is_disabled():
         try:
             save_firestore_doc_admin(doc_id, stored)
-            return stored
+            mark_firestore_success()
+            return True
         except Exception as error:
             print(f"History Firestore admin write fallback for {doc_id}: {error}")
             disable_firestore_admin_temporarily(error, "admin write")
@@ -557,15 +603,66 @@ def save_raw_doc(doc_id, data):
             timeout=3,
         )
         response.raise_for_status()
+        mark_firestore_success()
+        return True
     except Exception as error:
         print(f"History Firestore write fallback for {doc_id}: {error}")
         disable_firestore_temporarily(error, "write")
-    return stored
+    return False
+
+
+def sync_history_storage(batch_size=25):
+    global _cloud_reconciled
+    if firestore_is_disabled():
+        return
+
+    if not _cloud_reconciled:
+        remote_docs = load_firestore_docs()
+        if firestore_is_disabled() or _last_firestore_error:
+            return
+        with _storage_lock:
+            local = {}
+            for doc in [*memory_docs_snapshot(), *load_file_docs()]:
+                if isinstance(doc, dict) and doc.get("doc_id"):
+                    remember_newest(local, doc["doc_id"], doc)
+            remote = {doc["doc_id"]: doc for doc in remote_docs if doc.get("doc_id")}
+            combined = dict(local)
+            for doc_id, doc in remote.items():
+                remember_newest(combined, doc_id, doc)
+            for doc_id, doc in combined.items():
+                if local.get(doc_id) != doc:
+                    save_file_doc(doc_id, doc)
+                _memory_docs[doc_id] = doc
+                if remote.get(doc_id) != doc:
+                    _pending_cloud_docs[doc_id] = doc
+                else:
+                    _pending_cloud_docs.pop(doc_id, None)
+            _cloud_reconciled = True
+
+    with _storage_lock:
+        pending_ids = list(_pending_cloud_docs)[:batch_size]
+    for doc_id in pending_ids:
+        with _storage_lock:
+            doc = _pending_cloud_docs.get(doc_id)
+            if doc is None:
+                continue
+            if not write_cloud_doc(doc_id, doc):
+                break
+            _pending_cloud_docs.pop(doc_id, None)
+
+
+async def history_storage_sync_loop():
+    while True:
+        try:
+            await asyncio.to_thread(sync_history_storage)
+        except Exception as error:
+            disable_firestore_temporarily(error, "recovery")
+        await asyncio.sleep(30)
 
 
 def load_docs_by_project_name(project_name):
     by_id = {}
-    for doc in [*_memory_docs.values(), *load_file_docs(), *load_firestore_docs()]:
+    for doc in [*memory_docs_snapshot(), *load_file_docs(), *load_firestore_docs()]:
         if not isinstance(doc, dict):
             continue
         if doc.get("project") != project_name:
@@ -573,7 +670,7 @@ def load_docs_by_project_name(project_name):
         doc_id = doc.get("doc_id")
         if not doc_id:
             continue
-        by_id[doc_id] = doc
+        remember_newest(by_id, doc_id, doc)
     return list(by_id.values())
 
 
@@ -584,6 +681,10 @@ def get_storage_status():
         file_docs = 0
 
     return {
+        "cloud_state": "degraded" if _last_firestore_error else "connected" if _last_firestore_success_at else "unverified",
+        "cloud_last_success_at": _last_firestore_success_at,
+        "cloud_reconciled": _cloud_reconciled,
+        "pending_cloud_docs": len(_pending_cloud_docs),
         "memory_docs": len(_memory_docs),
         "file_docs": file_docs,
         "firestore_admin_enabled": USE_FIRESTORE_ADMIN,

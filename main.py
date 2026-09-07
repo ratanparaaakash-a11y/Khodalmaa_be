@@ -1,14 +1,31 @@
+import asyncio
+from contextlib import asynccontextmanager
+
 from fastapi import HTTPException,status,FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from firebase.firebase import FirebaseRouter
 from history.history import HistoryRouter
+from history.session_history import history_storage_sync_loop
 from project1.project1 import Project1Router
 from project2.project2 import Project2Router
 from telegram.telegram import TelegramRouter
 import uvicorn
 
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app):
+    sync_task = asyncio.create_task(history_storage_sync_loop())
+    try:
+        yield
+    finally:
+        sync_task.cancel()
+        try:
+            await sync_task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

@@ -22,7 +22,9 @@ HistoryRouter = APIRouter(prefix="/api/v1")
 
 @HistoryRouter.get("/history/health")
 async def history_health():
-    return {"status": "ok", "feature": "session_history", "storage": get_storage_status()}
+    storage = get_storage_status()
+    status = "ok" if storage["cloud_state"] == "connected" else storage["cloud_state"]
+    return {"status": status, "feature": "session_history", "storage": storage}
 
 
 @HistoryRouter.get("/history")
