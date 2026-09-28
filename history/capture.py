@@ -24,6 +24,7 @@ _lock = threading.RLock()
 _tasks = {}
 _generations = {}
 _errors = {}
+_settled_files = {}
 
 
 def scheduled_session(received_at=None):
@@ -109,6 +110,17 @@ def checkpoint_path(key):
     return capture_directory() / f"{key}.json"
 
 
+def checkpoint_signature(path):
+    stat = path.stat()
+    return stat.st_mtime_ns, stat.st_size, stat.st_ino
+
+
+def unchanged_settled_checkpoint(key):
+    path = checkpoint_path(key)
+    with _lock:
+        return _settled_files.get(str(path)) == checkpoint_signature(path)
+
+
 def record_error(key, error):
     _errors[key] = f"{type(error).__name__}: {error}"[:300]
 
@@ -125,6 +137,7 @@ def atomic_checkpoint(key, checkpoint):
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        _settled_files.pop(str(path), None)
     finally:
         if temporary and os.path.exists(temporary):
             os.unlink(temporary)
@@ -148,6 +161,9 @@ def read_checkpoint(key):
     receipt = float(checkpoint["last_received_at"])
     if scheduled_session(receipt) != window:
         raise ValueError("Capture receipt is outside its scheduled session")
+    if checkpoint["version"] == checkpoint["flushed_version"]:
+        _settled_files[str(path)] = checkpoint_signature(path)
+        _errors.pop(key, None)
     return checkpoint
 
 
@@ -270,6 +286,8 @@ def recover_pending(now=None, force=False):
         return pending
     for path in paths:
         try:
+            if unchanged_settled_checkpoint(path.stem):
+                continue
             flush_capture(path.stem, force=force, now=now)
             if pending_delay(path.stem) is not None:
                 pending.append(path.stem)
@@ -315,6 +333,8 @@ def recording_status():
             paths = []
         for path in paths:
             try:
+                if unchanged_settled_checkpoint(path.stem):
+                    continue
                 checkpoint = read_checkpoint(path.stem)
                 if checkpoint["version"] > checkpoint["flushed_version"]:
                     pending.append(path.stem)

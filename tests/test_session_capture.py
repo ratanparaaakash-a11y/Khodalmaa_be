@@ -18,6 +18,7 @@ from history.history import HistoryRouter, history_health
 from history.rules import HARDCODED_NUM1
 from project1 import project1
 from project2 import project2
+from security import require_user
 
 
 def epoch(iso):
@@ -48,7 +49,7 @@ class CaptureTestCase(unittest.TestCase):
             mocked = patch.object(history, name, value)
             mocked.start()
             self.addCleanup(mocked.stop)
-        for name, value in {"_tasks": {}, "_generations": {}, "_errors": {}}.items():
+        for name, value in {"_tasks": {}, "_generations": {}, "_errors": {}, "_settled_files": {}}.items():
             mocked = patch.object(capture, name, value)
             mocked.start()
             self.addCleanup(mocked.stop)
@@ -321,6 +322,7 @@ class RouteTests(CaptureTestCase):
         self.app.include_router(project1.Project1Router)
         self.app.include_router(project2.Project2Router)
         self.app.include_router(HistoryRouter)
+        self.app.dependency_overrides[require_user] = lambda: {"uid": "test-user"}
         for module, prefix in ((project1, "project1"), (project2, "project2")):
             for name, value in ((f"latest_{prefix}_data", {}), (f"{prefix}_session_started_at", None),
                                 (f"last_{prefix}_hit_at", None), ("_data_lock", asyncio.Lock()),
@@ -379,6 +381,9 @@ class RouteTests(CaptureTestCase):
             async def json(self):
                 return self.data
 
+            async def body(self):
+                return json.dumps(self.data).encode()
+
         class Socket:
             def __init__(self):
                 self.messages = []
@@ -414,6 +419,9 @@ class RouteTests(CaptureTestCase):
             async def json(self):
                 return self.data
 
+            async def body(self):
+                return json.dumps(self.data).encode()
+
         class Socket:
             messages = []
 
@@ -430,7 +438,8 @@ class RouteTests(CaptureTestCase):
             await second_tasks()
             await first_tasks()
             self.assertEqual(len(socket.messages), 1)
-            self.assertEqual(set(socket.messages[0]), {"machine1", "machine2"})
+            self.assertEqual(set(socket.messages[0]), {"machine1", "machine2", "__full_snapshot"})
+            self.assertTrue(socket.messages[0]["__full_snapshot"])
 
         asyncio.run(exercise())
 

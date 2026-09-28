@@ -1,8 +1,11 @@
 import asyncio
+import copy
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from history import capture
+from request_data import json_object
+from security import require_admin, require_user
 
 from history.session_history import (
     analyze_history,
@@ -42,9 +45,9 @@ async def get_history(
     return await asyncio.to_thread(analyze_history, normalize_project(project), safe_session(session), safe_days(days))
 
 
-@HistoryRouter.post("/history/snapshot-current")
+@HistoryRouter.post("/history/snapshot-current", dependencies=[Depends(require_user)])
 async def snapshot_current(req: Request):
-    body = await req.json() if req.headers.get("content-length") else {}
+    body = await json_object(req, allow_empty=True)
     requested_project = str(body.get("project") or "both").lower()
     session_override = body.get("session")
     results = []
@@ -69,9 +72,9 @@ async def snapshot_current(req: Request):
     return {"status": "success", "results": results}
 
 
-@HistoryRouter.post("/history/snapshot")
+@HistoryRouter.post("/history/snapshot", dependencies=[Depends(require_admin)])
 async def snapshot_payload(req: Request):
-    body = await req.json()
+    body = await json_object(req)
     requested_project = normalize_project(body.get("project"))
     data = body.get("data") or {}
     result = await asyncio.to_thread(
@@ -85,9 +88,9 @@ async def snapshot_payload(req: Request):
     return {"status": "success", "result": result}
 
 
-@HistoryRouter.post("/history/snapshot-built")
+@HistoryRouter.post("/history/snapshot-built", dependencies=[Depends(require_admin)])
 async def snapshot_built(req: Request):
-    body = await req.json()
+    body = await json_object(req)
     result = await asyncio.to_thread(
         save_built_session_snapshot,
         body.get("project"),
@@ -100,9 +103,9 @@ async def snapshot_built(req: Request):
     return {"status": "success", "result": result}
 
 
-@HistoryRouter.post("/project220/sent-low-snapshot")
+@HistoryRouter.post("/project220/sent-low-snapshot", dependencies=[Depends(require_user)])
 async def project220_sent_low_snapshot(req: Request):
-    body = await req.json()
+    body = await json_object(req)
     from project1 import project1 as p220_module
 
     result = await asyncio.to_thread(
@@ -123,7 +126,7 @@ async def project220_sent_low_calculation(
 
     return await asyncio.to_thread(
         analyze_project220_sent_low_report,
-        p220_module.latest_project1_data,
+        copy.deepcopy(p220_module.latest_project1_data),
         business_date,
         session,
     )

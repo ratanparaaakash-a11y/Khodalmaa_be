@@ -1,13 +1,16 @@
 import asyncio
 import copy
 import json
+import math
 import os
+import re
 import tempfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
+from uuid import uuid4
 
 from fastapi import HTTPException
 import httpx
@@ -29,12 +32,9 @@ COLLECTION_NAME = "session_low_history"
 PROJECT220_SENT_LOW_PROJECT = "project220_sent_low"
 BUSINESS_DAY_RESET_HOUR = 4
 AUTO_FINALIZE_SECONDS = 90
-MAX_SESSION_PER_DAY = 2
 INDIA_TZ = timezone(timedelta(hours=5, minutes=30))
 USE_FIRESTORE_ADMIN = os.getenv("HISTORY_FIRESTORE_ADMIN") == "1"
 
-_finalize_tasks = {}
-_session_number_cache = {}
 _memory_docs = {}
 _cached_token = None
 _cached_token_until = 0
@@ -701,24 +701,6 @@ def get_storage_status():
     }
 
 
-def get_existing_sessions(project, business_date):
-    sessions = []
-    for session in range(1, MAX_SESSION_PER_DAY + 1):
-        if load_doc(project, business_date, session):
-            sessions.append(session)
-    return sessions
-
-
-def get_session_number(project, business_date, session_started_at, session_override=None):
-    from history.capture import scheduled_session, validate_session
-    if session_override is not None:
-        return validate_session(session_override)
-    window = scheduled_session(session_started_at)
-    if not window or window["business_date"] != business_date:
-        raise HTTPException(status_code=409, detail="No scheduled session for this capture")
-    return window["session"]
-
-
 def save_session_snapshot(project, data, session_started_at=None, source="auto", session_override=None):
     from history.capture import accept_data, flush_capture, scheduled_session, validate_session
     normalized_project = normalize_project(project)
@@ -739,13 +721,22 @@ def save_session_snapshot(project, data, session_started_at=None, source="auto",
 def save_built_session_snapshot(project, business_date, session, entries, saved_at=None, source="restore"):
     from history.capture import validate_session
     normalized_project = normalize_project(project)
-    safe_entries = [copy.deepcopy(entry) for entry in entries if isinstance(entry, dict)]
     session_number = validate_session(session)
+    date_text = str(business_date or get_business_date())
+    try:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_text):
+            raise ValueError()
+        datetime.strptime(date_text, "%Y-%m-%d")
+        if saved_at is not None:
+            datetime.fromisoformat(str(saved_at).replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid history date or saved_at timestamp") from None
+    safe_entries = validate_built_entries(normalized_project, entries)
     first_count = sum(1 for entry in safe_entries if entry.get("half_key") == "first")
     second_count = sum(1 for entry in safe_entries if entry.get("half_key") == "second")
     snapshot = {
         "project": normalized_project,
-        "business_date": str(business_date or get_business_date()),
+        "business_date": date_text,
         "session": session_number,
         "session_key": f"S{session_number}",
         "session_started_at": 0,
@@ -767,13 +758,61 @@ def save_built_session_snapshot(project, business_date, session, entries, saved_
     }
 
 
+def validate_built_entries(project, entries):
+    expected_count = PROJECT10_LOW_COUNT if project == "project10" else len(ALL_COLUMNS) * (
+        PROJECT220_FIRST_HALF_LOW_COUNT + PROJECT220_SECOND_HALF_LOW_COUNT)
+    if not isinstance(entries, list) or len(entries) != expected_count:
+        raise HTTPException(status_code=400, detail="History restore requires a complete session")
+    safe_entries, seen, ranks = [], set(), {}
+    try:
+        for entry in entries:
+            if not isinstance(entry, dict) or isinstance(entry.get("rank"), bool):
+                raise ValueError()
+            rank = int(str(entry.get("rank")))
+            number = int(str(entry.get("number")))
+            clean = copy.deepcopy(entry)
+            if project == "project10":
+                if not 0 <= number <= 9 or not 1 <= rank <= PROJECT10_LOW_COUNT:
+                    raise ValueError()
+                key = f"project10:{number}"
+                group = "project10"
+                clean.update(number=str(number), rank=rank, key=key)
+            else:
+                raw_column = int(str(entry.get("column")))
+                column = 10 if raw_column == 0 else raw_column
+                half = entry.get("half_key")
+                if column not in ALL_COLUMNS or half not in {"first", "second"}:
+                    raise ValueError()
+                start, end = PROJECT220_FIRST_HALF_RANGE if half == "first" else PROJECT220_SECOND_HALF_RANGE
+                limit = PROJECT220_FIRST_HALF_LOW_COUNT if half == "first" else PROJECT220_SECOND_HALF_LOW_COUNT
+                if number not in HARDCODED_NUM1[column][start:end] or not 1 <= rank <= limit:
+                    raise ValueError()
+                display_col, display_number = display_column(column), display_project220_number(number)
+                group = f"{half}:{display_col}"
+                key = f"project220:{group}:{display_number}"
+                clean.update(number=display_number, column=display_col, rank=rank, key=key,
+                             half_key=half, half="First Half" if half == "first" else "Second Half",
+                             row_index=HARDCODED_NUM1[column].index(number))
+            if key in seen or rank in ranks.setdefault(group, set()):
+                raise ValueError()
+            seen.add(key)
+            ranks[group].add(rank)
+            safe_entries.append(clean)
+        if project == "project220" and len(ranks) != len(ALL_COLUMNS) * 2:
+            raise ValueError()
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="History entries contain invalid or duplicate selections") from None
+    return safe_entries
+
+
 def normalize_sent_low_entry(entry):
     if not isinstance(entry, dict):
         return None
 
     parsed = parse_arrow_entry(entry.get("entry"))
     try:
-        number = int(str(entry.get("number") or (parsed[0] if parsed else "")).strip())
+        raw_number = entry.get("number")
+        number = int(str(raw_number if raw_number is not None else (parsed[0] if parsed else "")).strip())
     except (TypeError, ValueError):
         return None
 
@@ -781,11 +820,15 @@ def normalize_sent_low_entry(entry):
         amount = float(entry.get("amount") if entry.get("amount") is not None else parsed[1])
     except (TypeError, ValueError, IndexError):
         return None
+    if not math.isfinite(amount):
+        return None
 
     raw_column = entry.get("column")
     try:
         column = 10 if str(raw_column) == "0" else int(raw_column)
     except (TypeError, ValueError):
+        return None
+    if column not in ALL_COLUMNS or number not in HARDCODED_NUM1[column]:
         return None
 
     half_key = "second" if str(entry.get("half") or "").lower().startswith("second") else "first"
@@ -803,17 +846,20 @@ def normalize_sent_low_entry(entry):
         "half": "Second Half" if half_key == "second" else "First Half",
         "rank": rank,
         "amount": amount,
-        "entry": f"{display_number}->{amount:g}",
+        "entry": f"{display_number}->{amount}",
         "key": f"project220-sent:{half_key}:{display_col}:{display_number}",
     }
 
 
 def save_project220_sent_low_snapshot(button, entries, session_started_at=None):
     from history.capture import scheduled_session
-    safe_entries = [
-        item for item in (normalize_sent_low_entry(entry) for entry in (entries or []))
-        if item is not None
-    ]
+    if not isinstance(entries, list):
+        raise HTTPException(status_code=400, detail="entries must be a list")
+    safe_entries = [normalize_sent_low_entry(entry) for entry in entries]
+    if any(item is None for item in safe_entries):
+        raise HTTPException(status_code=400, detail="Sent low entries contain an invalid amount or number")
+    if len({item["key"] for item in safe_entries}) != len(safe_entries):
+        raise HTTPException(status_code=400, detail="Sent low entries contain duplicate numbers")
     if not safe_entries:
         return {"saved": False, "reason": "No sent low entries"}
 
@@ -823,7 +869,7 @@ def save_project220_sent_low_snapshot(button, entries, session_started_at=None):
     business_date = window["business_date"]
     session = window["session"]
     now_epoch_ms = int(time.time() * 1000)
-    doc_id = f"{business_date}-s{session}-project220-sent-low-{now_epoch_ms}"
+    doc_id = f"{business_date}-s{session}-project220-sent-low-{now_epoch_ms}-{uuid4().hex[:12]}"
     button_key = "second" if str(button or "").lower().startswith("second") else "first"
     snapshot = {
         "project": PROJECT220_SENT_LOW_PROJECT,
@@ -870,7 +916,7 @@ def find_project220_current_amount(summed, entry):
     column = 10 if str(entry.get("column")) == "0" else int(entry.get("column") or 0)
     target_number = 0 if str(entry.get("number")) == "000" else int(entry.get("number") or 0)
     for item in summed.get(column, []):
-        if int(item.get("number") or -1) == target_number:
+        if item.get("number") is not None and int(item["number"]) == target_number:
             return float(item.get("amount") or 0)
     return 0.0
 
@@ -933,18 +979,6 @@ def analyze_project220_sent_low_report(current_data, business_date=None, session
         },
         "entries": report_entries,
     }
-
-
-async def delayed_finalize(project, data_ref, session_started_at, token):
-    # Compatibility shim: capture at invocation, never after the debounce delay.
-    schedule_session_finalize(project, data_ref, session_started_at)
-
-
-def schedule_session_finalize(project, data_ref, session_started_at=None):
-    from history.capture import accept_data, schedule_capture
-    accepted = accept_data(project, data_ref)
-    if accepted["recording"]:
-        schedule_capture(accepted["key"])
 
 
 def date_range(days):
@@ -1061,7 +1095,7 @@ def combined_sort_key(entry):
     return (
         -float(entry.get("average_score") or 0),
         float(entry.get("avg_rank") or 999),
-        int(entry.get("row_index") or 999),
+        int(entry["row_index"]) if entry.get("row_index") is not None else 999,
         str(entry.get("number") or ""),
     )
 
@@ -1116,20 +1150,6 @@ def build_combined_snapshot(project, business_date, docs):
         "second_half_count": second_count,
         "entries": entries,
     }
-
-
-def load_combined_snapshots(project, days):
-    snapshots = []
-    for business_date in date_range(days):
-        docs = []
-        for session in range(1, MAX_SESSION_PER_DAY + 1):
-            doc = load_doc(project, business_date, session)
-            if doc:
-                docs.append(doc)
-        snapshot = build_combined_snapshot(project, business_date, docs)
-        if snapshot:
-            snapshots.append(snapshot)
-    return snapshots
 
 
 def build_average_metrics(current_entries, break_today, latest):

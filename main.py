@@ -1,7 +1,8 @@
 import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import HTTPException,status,FastAPI
+from fastapi import Depends, FastAPI
+from security import require_user
 from fastapi.middleware.cors import CORSMiddleware
 from firebase.firebase import FirebaseRouter
 from history.history import HistoryRouter
@@ -46,7 +47,7 @@ app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,          
+    allow_credentials=False,
     allow_methods=["*"],    
     allow_headers=["*"],
 ) 
@@ -60,7 +61,12 @@ app.include_router(TelegramRouter)
 
 @app.get("/")
 async def ping():
-    print("server is on")
+    return {"status": "ok", "release": "2026-09-28-audit-1"}
+
+
+@app.get("/api/v1/auth/verify", dependencies=[Depends(require_user)])
+async def verify_session():
+    return {"authenticated": True}
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000)

@@ -2,6 +2,7 @@ import asyncio
 
 from fastapi import Request, APIRouter, BackgroundTasks, HTTPException, WebSocket
 from history import capture
+from request_data import json_object
 import time
 
 Project1Router = APIRouter(prefix="/api/v1")
@@ -27,6 +28,7 @@ def restore_project1_capture():
 
 def with_project1_meta(data, session_reset=False):
     payload = dict(data)
+    payload["__full_snapshot"] = True
     if project1_session_started_at is not None:
         payload["__session_started_at"] = project1_session_started_at
     if session_reset:
@@ -61,7 +63,7 @@ async def get_p1_data(req: Request, background_tasks: BackgroundTasks):
     global last_project1_hit_at, project1_session_started_at, _broadcast_revision
 
     try:
-        data = await req.json()
+        data = await json_object(req)
         now = time.time()
         async with _data_lock:
             accepted = await asyncio.to_thread(capture.accept_data, "project220", data, now)
@@ -88,13 +90,13 @@ async def get_p1_data(req: Request, background_tasks: BackgroundTasks):
 @Project1Router.websocket("/ws_project1")
 async def ws_project1(websocket: WebSocket):
     await websocket.accept()
-    connections_project1.append(websocket)
     print("Frontend connected to Project1 WS")
-
-    # Send current state immediately on connect
-    await websocket.send_json(with_project1_meta(latest_project1_data))
-
     try:
+        # Serialize the initial full state with subsequent broadcasts so a slow
+        # initial send cannot arrive after a newer live update.
+        async with _broadcast_lock:
+            await asyncio.wait_for(websocket.send_json(with_project1_meta(latest_project1_data)), timeout=1)
+            connections_project1.append(websocket)
         while True:
             await websocket.receive_text()
     except Exception:
