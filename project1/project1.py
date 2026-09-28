@@ -1,7 +1,7 @@
 import asyncio
 
 from fastapi import Request, APIRouter, BackgroundTasks, HTTPException, WebSocket
-from history.session_history import schedule_session_finalize
+from history import capture
 import time
 
 Project1Router = APIRouter(prefix="/api/v1")
@@ -11,7 +11,19 @@ latest_project1_data = {}
 connections_project1 = []
 last_project1_hit_at = None
 project1_session_started_at = None
-SESSION_IDLE_RESET_SECONDS = 45 * 60
+_data_lock = asyncio.Lock()
+_broadcast_lock = asyncio.Lock()
+_broadcast_revision = 0
+
+
+def restore_project1_capture():
+    global project1_session_started_at, last_project1_hit_at
+    checkpoint = capture.active_capture("project220")
+    if checkpoint:
+        latest_project1_data.clear()
+        latest_project1_data.update(checkpoint["data"])
+        project1_session_started_at = checkpoint["session_started_at"]
+        last_project1_hit_at = checkpoint["last_received_at"]
 
 def with_project1_meta(data, session_reset=False):
     payload = dict(data)
@@ -21,9 +33,7 @@ def with_project1_meta(data, session_reset=False):
         payload["__session_reset"] = True
     return payload
 
-async def broadcast_project1_data(data, session_reset=False):
-    payload = with_project1_meta(data, session_reset)
-
+async def broadcast_project1_data(payload, revision):
     async def send_to_connection(conn):
         try:
             await asyncio.wait_for(conn.send_json(payload), timeout=1)
@@ -32,58 +42,48 @@ async def broadcast_project1_data(data, session_reset=False):
             print(f"Error sending to Project1 WebSocket: {e}")
             return conn
 
-    stale_connections = [
-        conn for conn in await asyncio.gather(
-            *(send_to_connection(conn) for conn in connections_project1.copy())
-        )
-        if conn is not None
-    ]
-
-    for conn in stale_connections:
-        if conn in connections_project1:
-            connections_project1.remove(conn)
+    async with _broadcast_lock:
+        if revision != _broadcast_revision:
+            return
+        stale_connections = [
+            conn for conn in await asyncio.gather(
+                *(send_to_connection(conn) for conn in connections_project1.copy())
+            )
+            if conn is not None
+        ]
+        for conn in stale_connections:
+            if conn in connections_project1:
+                connections_project1.remove(conn)
 
 
 @Project1Router.post("/project1_data")
 async def get_p1_data(req: Request, background_tasks: BackgroundTasks):
-    global last_project1_hit_at, project1_session_started_at
+    global last_project1_hit_at, project1_session_started_at, _broadcast_revision
 
     try:
         data = await req.json()
         now = time.time()
-        session_reset = (
-            last_project1_hit_at is not None and
-            now - last_project1_hit_at > SESSION_IDLE_RESET_SECONDS
-        )
-        if session_reset:
-            latest_project1_data.clear()
-            project1_session_started_at = now
-            print("Project1 idle session reset")
-        elif project1_session_started_at is None:
-            project1_session_started_at = now
-
-        last_project1_hit_at = now
-        print(f"project1 machines: {list(data.keys())} at {now}")
-        normalized_data = {}
-
-        # Merge arrays per machine
-        for machine_id, values in data.items():
-            if not isinstance(machine_id, str) or not machine_id.lower().startswith("machine"):
-                print(f"Skipping invalid project1 key: {machine_id}")
-                continue
-
-            normalized_machine_id = machine_id.lower()
-            latest_project1_data[normalized_machine_id] = values
-            normalized_data[normalized_machine_id] = values
-
-        schedule_session_finalize("project220", latest_project1_data, project1_session_started_at)
-        background_tasks.add_task(broadcast_project1_data, normalized_data, session_reset)
-
+        async with _data_lock:
+            accepted = await asyncio.to_thread(capture.accept_data, "project220", data, now)
+            session_reset = False
+            if accepted["recording"]:
+                session_reset = project1_session_started_at != accepted["session_started_at"]
+                project1_session_started_at = accepted["session_started_at"]
+                latest_project1_data.clear()
+                capture.schedule_capture(accepted["key"])
+            latest_project1_data.update(accepted["data"])
+            last_project1_hit_at = now
+            # Full merged payload restores earlier machines after a restart.
+            normalized_data = dict(accepted["data"])
+            _broadcast_revision += 1
+            payload = with_project1_meta(latest_project1_data, session_reset)
+            background_tasks.add_task(broadcast_project1_data, payload, _broadcast_revision)
         return {"status": "success", "data": normalized_data}
-
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"An Error occurred on our site project1 {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=503, detail="Project220 data could not be durably accepted")
 
 @Project1Router.websocket("/ws_project1")
 async def ws_project1(websocket: WebSocket):

@@ -1,7 +1,7 @@
 import asyncio
 
 from fastapi import Request, APIRouter, BackgroundTasks, HTTPException, WebSocket
-from history.session_history import schedule_session_finalize
+from history import capture
 import time
 Project2Router = APIRouter(prefix="/api/v1")
 
@@ -10,7 +10,19 @@ latest_project2_data = {}
 connections_project2 = []
 last_project2_hit_at = None
 project2_session_started_at = None
-SESSION_IDLE_RESET_SECONDS = 45 * 60
+_data_lock = asyncio.Lock()
+_broadcast_lock = asyncio.Lock()
+_broadcast_revision = 0
+
+
+def restore_project2_capture():
+    global project2_session_started_at, last_project2_hit_at
+    checkpoint = capture.active_capture("project10")
+    if checkpoint:
+        latest_project2_data.clear()
+        latest_project2_data.update(checkpoint["data"])
+        project2_session_started_at = checkpoint["session_started_at"]
+        last_project2_hit_at = checkpoint["last_received_at"]
 
 def with_project2_meta(data, session_reset=False):
     payload = dict(data)
@@ -21,9 +33,7 @@ def with_project2_meta(data, session_reset=False):
     return payload
 
 
-async def broadcast_project2_data(data, session_reset=False):
-    payload = with_project2_meta(data, session_reset)
-
+async def broadcast_project2_data(payload, revision):
     async def send_to_connection(conn):
         try:
             await asyncio.wait_for(conn.send_json(payload), timeout=1)
@@ -32,68 +42,47 @@ async def broadcast_project2_data(data, session_reset=False):
             print(f"Error sending to Project2 WebSocket: {e}")
             return conn
 
-    stale_connections = [
-        conn for conn in await asyncio.gather(
-            *(send_to_connection(conn) for conn in connections_project2.copy())
-        )
-        if conn is not None
-    ]
-
-    for conn in stale_connections:
-        if conn in connections_project2:
-            connections_project2.remove(conn)
+    async with _broadcast_lock:
+        if revision != _broadcast_revision:
+            return
+        stale_connections = [
+            conn for conn in await asyncio.gather(
+                *(send_to_connection(conn) for conn in connections_project2.copy())
+            )
+            if conn is not None
+        ]
+        for conn in stale_connections:
+            if conn in connections_project2:
+                connections_project2.remove(conn)
 
 
 @Project2Router.post("/project2_data")
 async def get_p2_data(req: Request, background_tasks: BackgroundTasks):
-    global last_project2_hit_at, project2_session_started_at
+    global last_project2_hit_at, project2_session_started_at, _broadcast_revision
 
     try:
         data = await req.json()
         now = time.time()
-        session_reset = (
-            last_project2_hit_at is not None and
-            now - last_project2_hit_at > SESSION_IDLE_RESET_SECONDS
-        )
-        if session_reset:
-            latest_project2_data.clear()
-            project2_session_started_at = now
-            print("Project2 idle session reset")
-        elif project2_session_started_at is None:
-            project2_session_started_at = now
-
-        last_project2_hit_at = now
-        print(f"project2 machines: {list(data.keys())} at {now}")
-        filtered_data = {}
-
-        for machine_id, values in data.items():
-            if not isinstance(values, list):
-                print(f"Skipping {machine_id}: values is not a list")
-                continue
-
-            if len(values) != 10:
-                print(f"Skipping {machine_id}: invalid length {len(values)}")
-                continue
-
-            if not all(isinstance(v, (int, float)) for v in values):
-                print(f"Skipping {machine_id}: contains non-numeric values")
-                continue
-
-            if any(v > 100000 for v in values):
-                print(f"Skipping {machine_id}: contains large value")
-                continue
-
-            filtered_data[machine_id] = values
-            latest_project2_data[machine_id] = values
-
-        schedule_session_finalize("project10", latest_project2_data, project2_session_started_at)
-        background_tasks.add_task(broadcast_project2_data, filtered_data, session_reset)
-
+        async with _data_lock:
+            accepted = await asyncio.to_thread(capture.accept_data, "project10", data, now)
+            session_reset = False
+            if accepted["recording"]:
+                session_reset = project2_session_started_at != accepted["session_started_at"]
+                project2_session_started_at = accepted["session_started_at"]
+                latest_project2_data.clear()
+                capture.schedule_capture(accepted["key"])
+            latest_project2_data.update(accepted["data"])
+            last_project2_hit_at = now
+            filtered_data = dict(accepted["data"])
+            _broadcast_revision += 1
+            payload = with_project2_meta(latest_project2_data, session_reset)
+            background_tasks.add_task(broadcast_project2_data, payload, _broadcast_revision)
         return {"status": "success", "data": filtered_data}
-
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"An error occurred in project2_data: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        raise HTTPException(status_code=503, detail="Project10 data could not be durably accepted")
 
 
 @Project2Router.websocket("/ws_project2")

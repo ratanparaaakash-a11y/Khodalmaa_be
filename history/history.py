@@ -2,6 +2,7 @@ import asyncio
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from history import capture
 
 from history.session_history import (
     analyze_history,
@@ -22,8 +23,10 @@ HistoryRouter = APIRouter(prefix="/api/v1")
 
 @HistoryRouter.get("/history/health")
 async def history_health():
-    storage = get_storage_status()
-    status = "ok" if storage["cloud_state"] == "connected" else storage["cloud_state"]
+    storage = await asyncio.to_thread(get_storage_status)
+    status = "degraded" if storage["recording"]["state"] == "degraded" else (
+        "ok" if storage["cloud_state"] == "connected" else storage["cloud_state"]
+    )
     return {"status": status, "feature": "session_history", "storage": storage}
 
 
@@ -47,26 +50,16 @@ async def snapshot_current(req: Request):
     results = []
 
     if requested_project in {"both", "project220", "p220", "project1"}:
-        from project1 import project1 as p220_module
-
         results.append(await asyncio.to_thread(
-            save_session_snapshot,
+            capture.snapshot_current,
             "project220",
-            p220_module.latest_project1_data,
-            p220_module.project1_session_started_at,
-            "manual",
             session_override,
         ))
 
     if requested_project in {"both", "project10", "p10", "project2"}:
-        from project2 import project2 as p10_module
-
         results.append(await asyncio.to_thread(
-            save_session_snapshot,
+            capture.snapshot_current,
             "project10",
-            p10_module.latest_project2_data,
-            p10_module.project2_session_started_at,
-            "manual",
             session_override,
         ))
 

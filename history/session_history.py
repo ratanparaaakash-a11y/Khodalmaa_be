@@ -81,15 +81,20 @@ def load_file_doc(doc_id):
 
 
 def save_file_doc(doc_id, data):
+    _file_store_dir.mkdir(parents=True, exist_ok=True)
+    path = get_file_path(doc_id)
+    temp_path = None
     try:
-        _file_store_dir.mkdir(parents=True, exist_ok=True)
-        path = get_file_path(doc_id)
-        temp_path = path.with_suffix(".tmp")
-        with temp_path.open("w", encoding="utf-8") as file:
-            json.dump(data, file, separators=(",", ":"))
-        temp_path.replace(path)
-    except Exception as error:
-        print(f"History file write fallback failed for {doc_id}: {error}")
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=_file_store_dir,
+                                         prefix=f".{doc_id}-", suffix=".tmp", delete=False) as file:
+            temp_path = file.name
+            json.dump(data, file, separators=(",", ":"), allow_nan=False)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
 
 
 def firestore_value(value):
@@ -572,8 +577,8 @@ def save_doc(snapshot):
 def save_raw_doc(doc_id, data):
     stored = {**data, "doc_id": doc_id, "updated_at": get_now_iso()}
     with _storage_lock:
-        _memory_docs[doc_id] = stored
         save_file_doc(doc_id, stored)
+        _memory_docs[doc_id] = stored
         # The snapshot file is the durable retry source after a process restart.
         _pending_cloud_docs[doc_id] = stored
         if write_cloud_doc(doc_id, stored):
@@ -675,6 +680,7 @@ def load_docs_by_project_name(project_name):
 
 
 def get_storage_status():
+    from history.capture import recording_status
     try:
         file_docs = len(list(_file_store_dir.glob("*.json"))) if _file_store_dir.exists() else 0
     except Exception:
@@ -691,6 +697,7 @@ def get_storage_status():
         "firestore_disabled_seconds": max(0, int(_firestore_disabled_until - time.time())),
         "firestore_admin_disabled_seconds": max(0, int(_firestore_admin_disabled_until - time.time())),
         "firestore_last_error": _last_firestore_error,
+        "recording": recording_status(),
     }
 
 
@@ -703,49 +710,37 @@ def get_existing_sessions(project, business_date):
 
 
 def get_session_number(project, business_date, session_started_at, session_override=None):
-    if session_override:
-        return safe_session(session_override)
-
-    cache_key = f"{project}:{business_date}:{session_started_at or 0}"
-    if cache_key in _session_number_cache:
-        return _session_number_cache[cache_key]
-
-    existing_sessions = get_existing_sessions(project, business_date)
-    for session in existing_sessions:
-        doc = load_doc(project, business_date, session)
-        if doc and float(doc.get("session_started_at") or 0) == float(session_started_at or 0):
-            _session_number_cache[cache_key] = session
-            return session
-
-    session = min(MAX_SESSION_PER_DAY, (max(existing_sessions) + 1) if existing_sessions else 1)
-    _session_number_cache[cache_key] = session
-    return session
+    from history.capture import scheduled_session, validate_session
+    if session_override is not None:
+        return validate_session(session_override)
+    window = scheduled_session(session_started_at)
+    if not window or window["business_date"] != business_date:
+        raise HTTPException(status_code=409, detail="No scheduled session for this capture")
+    return window["session"]
 
 
 def save_session_snapshot(project, data, session_started_at=None, source="auto", session_override=None):
+    from history.capture import accept_data, flush_capture, scheduled_session, validate_session
     normalized_project = normalize_project(project)
-    if not data:
-        return {"project": normalized_project, "saved": False, "reason": "No live data available"}
-
-    business_date = get_business_date()
-    session = get_session_number(normalized_project, business_date, session_started_at, session_override)
-    snapshot = build_snapshot(normalized_project, copy.deepcopy(data), business_date, session, session_started_at, source)
-    saved = save_doc(snapshot)
-    print(f"Saved {normalized_project} history {business_date} S{session}: {saved['entry_count']} entries")
-    return {
-        "project": normalized_project,
-        "saved": True,
-        "business_date": business_date,
-        "session": session,
-        "entry_count": saved["entry_count"],
-        "doc_id": saved["doc_id"],
-    }
+    if session_override is not None:
+        validate_session(session_override)
+    # Supplied/old process-start timestamps never decide today's recording slot.
+    received_at = time.time()
+    window = scheduled_session(received_at)
+    if not window:
+        return {"project": normalized_project, "saved": False,
+                "reason": "Outside the two scheduled recording windows"}
+    if session_override is not None and int(session_override) != window["session"]:
+        raise HTTPException(status_code=409, detail="Requested session does not match the recording window")
+    accepted = accept_data(normalized_project, data, received_at)
+    return flush_capture(accepted["key"], force=True, source=source)
 
 
 def save_built_session_snapshot(project, business_date, session, entries, saved_at=None, source="restore"):
+    from history.capture import validate_session
     normalized_project = normalize_project(project)
     safe_entries = [copy.deepcopy(entry) for entry in entries if isinstance(entry, dict)]
-    session_number = safe_session(session)
+    session_number = validate_session(session)
     first_count = sum(1 for entry in safe_entries if entry.get("half_key") == "first")
     second_count = sum(1 for entry in safe_entries if entry.get("half_key") == "second")
     snapshot = {
@@ -814,6 +809,7 @@ def normalize_sent_low_entry(entry):
 
 
 def save_project220_sent_low_snapshot(button, entries, session_started_at=None):
+    from history.capture import scheduled_session
     safe_entries = [
         item for item in (normalize_sent_low_entry(entry) for entry in (entries or []))
         if item is not None
@@ -821,8 +817,11 @@ def save_project220_sent_low_snapshot(button, entries, session_started_at=None):
     if not safe_entries:
         return {"saved": False, "reason": "No sent low entries"}
 
-    business_date = get_business_date()
-    session = get_session_number("project220", business_date, session_started_at, None)
+    window = scheduled_session()
+    if not window:
+        return {"saved": False, "reason": "Outside the two scheduled recording windows"}
+    business_date = window["business_date"]
+    session = window["session"]
     now_epoch_ms = int(time.time() * 1000)
     doc_id = f"{business_date}-s{session}-project220-sent-low-{now_epoch_ms}"
     button_key = "second" if str(button or "").lower().startswith("second") else "first"
@@ -831,7 +830,7 @@ def save_project220_sent_low_snapshot(button, entries, session_started_at=None):
         "business_date": business_date,
         "session": session,
         "session_key": f"S{session}",
-        "session_started_at": float(session_started_at or time.time()),
+        "session_started_at": window["session_started_at"],
         "button": button_key,
         "button_label": "3 Low Second" if button_key == "second" else "4 Low First",
         "sent_at": get_now_iso(),
@@ -937,31 +936,15 @@ def analyze_project220_sent_low_report(current_data, business_date=None, session
 
 
 async def delayed_finalize(project, data_ref, session_started_at, token):
-    try:
-        await asyncio.sleep(AUTO_FINALIZE_SECONDS)
-        current = _finalize_tasks.get(project)
-        if not current or current.get("token") != token:
-            return
-        await asyncio.to_thread(save_session_snapshot, project, copy.deepcopy(data_ref), session_started_at, "auto", None)
-    except asyncio.CancelledError:
-        return
-    except Exception as error:
-        print(f"History auto finalize error for {project}: {error}")
+    # Compatibility shim: capture at invocation, never after the debounce delay.
+    schedule_session_finalize(project, data_ref, session_started_at)
 
 
 def schedule_session_finalize(project, data_ref, session_started_at=None):
-    try:
-        normalized_project = normalize_project(project)
-    except HTTPException:
-        return
-
-    current = _finalize_tasks.get(normalized_project)
-    if current and current.get("task"):
-        current["task"].cancel()
-
-    token = time.time()
-    task = asyncio.create_task(delayed_finalize(normalized_project, copy.deepcopy(data_ref), session_started_at, token))
-    _finalize_tasks[normalized_project] = {"task": task, "token": token}
+    from history.capture import accept_data, schedule_capture
+    accepted = accept_data(project, data_ref)
+    if accepted["recording"]:
+        schedule_capture(accepted["key"])
 
 
 def date_range(days):
