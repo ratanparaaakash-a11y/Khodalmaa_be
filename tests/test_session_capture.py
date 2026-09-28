@@ -48,7 +48,7 @@ class CaptureTestCase(unittest.TestCase):
             mocked = patch.object(history, name, value)
             mocked.start()
             self.addCleanup(mocked.stop)
-        for name, value in {"_tasks": {}, "_errors": {}}.items():
+        for name, value in {"_tasks": {}, "_generations": {}, "_errors": {}}.items():
             mocked = patch.object(capture, name, value)
             mocked.start()
             self.addCleanup(mocked.stop)
@@ -208,6 +208,39 @@ class DurabilityTests(CaptureTestCase):
         self.assertEqual(checkpoint["version"], 2)
         self.assertEqual(checkpoint["flushed_version"], 1)
         self.assertEqual(checkpoint["data"]["machine1"][0], 9)
+
+    def test_receipt_arriving_as_finalizer_exits_is_still_flushed_at_close(self):
+        accepted = capture.accept_data("project10", p10(), self.s1)
+        capture.flush_capture(accepted["key"], force=True, now=self.s1 + 90)
+        read_complete, release = threading.Event(), threading.Event()
+        actual_delay = capture.pending_delay
+        first = True
+
+        def controlled_delay(key):
+            nonlocal first
+            result = actual_delay(key)
+            if first:
+                first = False
+                read_complete.set()
+                if not release.wait(3):
+                    raise RuntimeError("test release timed out")
+            return result
+
+        async def exercise():
+            capture.schedule_capture(accepted["key"])
+            task = capture._tasks[accepted["key"]]
+            self.assertTrue(await asyncio.to_thread(read_complete.wait, 3))
+            await asyncio.to_thread(capture.accept_data, "project10", p10(6), self.s1_end - 1)
+            capture.schedule_capture(accepted["key"])
+            release.set()
+            await asyncio.wait_for(task, 3)
+
+        with patch.object(capture, "pending_delay", side_effect=controlled_delay), \
+                patch.object(capture.time, "time", return_value=self.s1_end):
+            asyncio.run(exercise())
+        checkpoint = capture.read_checkpoint(accepted["key"])
+        self.assertEqual(checkpoint["version"], 2)
+        self.assertEqual(checkpoint["flushed_version"], 2)
 
     def test_corrupt_checkpoint_is_not_silently_replaced(self):
         accepted = capture.accept_data("project10", p10(), self.s1)

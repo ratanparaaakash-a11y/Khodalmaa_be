@@ -22,6 +22,7 @@ from history.rules import ALL_COLUMNS, HARDCODED_NUM1
 
 _lock = threading.RLock()
 _tasks = {}
+_generations = {}
 _errors = {}
 
 
@@ -220,8 +221,11 @@ def flush_capture(key, force=False, now=None, source="auto"):
 async def delayed_flush(key):
     try:
         while True:
+            generation = _generations.get(key, 0)
             delay = await asyncio.to_thread(pending_delay, key)
             if delay is None:
+                if _generations.get(key, 0) != generation:
+                    continue
                 return
             if delay:
                 await asyncio.sleep(delay)
@@ -241,6 +245,7 @@ async def delayed_flush(key):
 def schedule_capture(key):
     # Do not cancel an in-flight thread. It serializes with newer receipts and
     # re-reads the checkpoint; the recovery loop also retries failed finalizers.
+    _generations[key] = _generations.get(key, 0) + 1
     task = _tasks.get(key)
     if task is None or task.done():
         _tasks[key] = asyncio.create_task(delayed_flush(key))
@@ -256,8 +261,13 @@ def pending_delay(key):
 
 def recover_pending(now=None, force=False):
     pending = []
-    with _lock:
-        paths = list(capture_directory().glob("*.json"))
+    try:
+        with _lock:
+            paths = list(capture_directory().glob("*.json"))
+            _errors.pop("capture_directory", None)
+    except Exception as error:
+        record_error("capture_directory", error)
+        return pending
     for path in paths:
         try:
             flush_capture(path.stem, force=force, now=now)
@@ -298,7 +308,12 @@ def snapshot_current(project, session_override=None, now=None):
 def recording_status():
     pending = []
     with _lock:
-        for path in capture_directory().glob("*.json"):
+        try:
+            paths = list(capture_directory().glob("*.json"))
+        except Exception as error:
+            record_error("capture_directory", error)
+            paths = []
+        for path in paths:
             try:
                 checkpoint = read_checkpoint(path.stem)
                 if checkpoint["version"] > checkpoint["flushed_version"]:
@@ -307,6 +322,7 @@ def recording_status():
                 record_error(path.stem, error)
         active = scheduled_session()
         return {
+            "recorder_version": 2,
             "state": "degraded" if _errors else "recording" if active else "outside_window",
             "timezone": "Asia/Kolkata", "window_end_exclusive": True,
             "schedule": {"S1": {"start": "21:30", "end": "22:05"},
