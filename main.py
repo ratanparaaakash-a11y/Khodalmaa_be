@@ -2,15 +2,15 @@ import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
-from security import require_user
-from fastapi.middleware.cors import CORSMiddleware
+from security import MachineCompatibleCORSMiddleware, require_user
 from firebase.firebase import FirebaseRouter
 from history.history import HistoryRouter
 from history.session_history import history_storage_sync_loop
 from history import capture
 from project1.project1 import Project1Router, restore_project1_capture
 from project2.project2 import (Project2Router, restore_project2_capture,
-                               restore_project2_temporary, temporary_expiry_loop)
+                               restore_project2_temporary, temporary_cloud_changed, temporary_expiry_loop)
+from project2 import temporary
 from telegram.telegram import TelegramRouter
 import uvicorn
 
@@ -28,12 +28,14 @@ async def lifespan(app):
     sync_task = asyncio.create_task(history_storage_sync_loop())
     recording_task = asyncio.create_task(capture.recording_loop())
     temporary_task = asyncio.create_task(temporary_expiry_loop())
+    cloud_temporary_task = asyncio.create_task(temporary.cloud_sync_loop(temporary_cloud_changed))
     try:
         yield
     finally:
         sync_task.cancel()
         recording_task.cancel()
         temporary_task.cancel()
+        cloud_temporary_task.cancel()
         try:
             await sync_task
         except asyncio.CancelledError:
@@ -46,18 +48,16 @@ async def lifespan(app):
             await temporary_task
         except asyncio.CancelledError:
             pass
+        try:
+            await cloud_temporary_task
+        except asyncio.CancelledError:
+            pass
         await capture.shutdown_recording()
 
 
 app = FastAPI(lifespan=lifespan)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],    
-    allow_headers=["*"],
-) 
+app.add_middleware(MachineCompatibleCORSMiddleware)
 
 app.include_router(FirebaseRouter)
 app.include_router(HistoryRouter)
@@ -68,8 +68,10 @@ app.include_router(TelegramRouter)
 
 @app.get("/")
 async def ping():
-    return {"status": "ok", "release": "2026-09-28-audit-1",
-            "features": {"project10_temporary_machines": True}}
+    return {"status": "ok", "release": "2026-10-05-security-1",
+            "features": {"project10_temporary_machines": True,
+                         "authenticated_browser_reads": True,
+                         "authenticated_websocket": True}}
 
 
 @app.get("/api/v1/auth/verify", dependencies=[Depends(require_user)])

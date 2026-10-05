@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException
 
 from history import capture
 from project2 import project2, temporary
+from security import require_user
 from test_session_capture import CaptureTestCase, p10
 
 
@@ -22,7 +23,9 @@ class TemporaryProject10TestCase(CaptureTestCase):
     def setUp(self):
         super().setUp()
         for module, replacements in (
-            (temporary, {"_entries": {}}),
+            (temporary, {"_entries": {}, "_retired": {}, "_blocked_names": set(),
+                         "_real_generations": {}, "_last_cloud_error": None,
+                         "_last_local_error": None}),
             (project2, {
                 "latest_project2_data": {}, "connections_project2": [],
                 "last_project2_hit_at": None, "project2_session_started_at": None,
@@ -34,22 +37,43 @@ class TemporaryProject10TestCase(CaptureTestCase):
                 mocked = patch.object(module, name, value)
                 mocked.start()
                 self.addCleanup(mocked.stop)
+        self.cloud_checkpoint = None
+        self.cloud_revision = None
+
+        def load_cloud():
+            return copy.deepcopy(self.cloud_checkpoint), self.cloud_revision
+
+        def save_cloud(checkpoint, revision):
+            if revision != self.cloud_revision:
+                raise temporary.cloud.CloudConflict("changed")
+            self.cloud_checkpoint = copy.deepcopy(checkpoint)
+            self.cloud_revision = str(int(self.cloud_revision or "0") + 1)
+
+        self.load_cloud = load_cloud
+        self.save_cloud = save_cloud
+        for name, callback in (("load", load_cloud), ("save", save_cloud)):
+            mocked = patch.object(temporary.cloud, name, side_effect=callback)
+            mocked.start()
+            self.addCleanup(mocked.stop)
         self.app = FastAPI()
         self.app.include_router(project2.Project2Router)
+        self.app.dependency_overrides[require_user] = lambda: {"uid": "test-user"}
         self.now = self.s1 + 10
 
-    async def post(self, data, path="/api/v1/project2_data"):
+    async def post(self, data, path=None):
         # Content, rather than httpx's strict JSON encoder, lets validation tests
         # exercise incoming non-finite JSON values without bypassing the router.
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=self.app), base_url="http://test"
         ) as client:
+            path = path or ("/api/v1/project2_temporary_data" if "__temporary_for_seconds" in data
+                            else "/api/v1/project2_data")
             return await client.post(
                 path, content=json.dumps(data),
                 headers={"Content-Type": "application/json"},
             )
 
-    def request(self, data, now=None, path="/api/v1/project2_data"):
+    def request(self, data, now=None, path=None):
         instant = self.now if now is None else now
         with patch.object(project2.time, "time", return_value=instant):
             return asyncio.run(self.post(data, path))
@@ -148,14 +172,14 @@ class TemporaryProject10StorageTests(TemporaryProject10TestCase):
         temporary.restore(now=self.now + 2)
         self.assertEqual(temporary.live_data(now=self.now + 2), {})
 
-    def test_failed_atomic_write_cannot_acknowledge_or_publish_undurable_overlay(self):
+    def test_cloud_confirmed_creation_survives_optional_local_cache_failure(self):
         with patch.object(temporary.os, "replace", side_effect=OSError("disk unavailable")):
-            with self.assertRaises(OSError):
-                self.create()
-        self.assertEqual(temporary.live_data(now=self.now), {})
+            self.create()
+        self.assertEqual(temporary.live_data(now=self.now), {"machine4": MACHINE4_VALUES})
+        self.assertEqual(temporary.storage_status()["local_cache_error"], "OSError")
         temporary._entries.clear()
         temporary.restore(now=self.now + 1)
-        self.assertEqual(temporary.live_data(now=self.now + 1), {})
+        self.assertEqual(temporary.live_data(now=self.now + 1), {"machine4": MACHINE4_VALUES})
 
 
 class TemporaryProject10ApiTests(TemporaryProject10TestCase):

@@ -1,6 +1,7 @@
 import asyncio
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from firebase_admin import auth
+from request_data import json_object
 from security import require_admin
 
 
@@ -8,7 +9,8 @@ FirebaseRouter = APIRouter(prefix="/api/v1")
 
 
 @FirebaseRouter.post("/create_user", dependencies=[Depends(require_admin)])
-async def create_user(payload: dict):
+async def create_user(request: Request):
+    payload = await json_object(request)
     email = payload.get("email")
     password = payload.get("password")
     if not isinstance(email, str) or not email.strip():

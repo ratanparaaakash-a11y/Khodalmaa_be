@@ -3,6 +3,7 @@ import asyncio
 from fastapi import Request, APIRouter, BackgroundTasks, HTTPException, WebSocket
 from history import capture
 from request_data import json_object
+from security import authenticate_websocket, authorize_machine_request, receive_authenticated_text
 import time
 
 Project1Router = APIRouter(prefix="/api/v1")
@@ -64,6 +65,7 @@ async def get_p1_data(req: Request, background_tasks: BackgroundTasks):
 
     try:
         data = await json_object(req)
+        authorize_machine_request(req, "project220", data)
         now = time.time()
         async with _data_lock:
             accepted = await asyncio.to_thread(capture.accept_data, "project220", data, now)
@@ -89,7 +91,9 @@ async def get_p1_data(req: Request, background_tasks: BackgroundTasks):
 
 @Project1Router.websocket("/ws_project1")
 async def ws_project1(websocket: WebSocket):
-    await websocket.accept()
+    claims = await authenticate_websocket(websocket)
+    if claims is None:
+        return
     print("Frontend connected to Project1 WS")
     try:
         # Serialize the initial full state with subsequent broadcasts so a slow
@@ -98,7 +102,7 @@ async def ws_project1(websocket: WebSocket):
             await asyncio.wait_for(websocket.send_json(with_project1_meta(latest_project1_data)), timeout=1)
             connections_project1.append(websocket)
         while True:
-            await websocket.receive_text()
+            await receive_authenticated_text(websocket, claims)
     except Exception:
         print("Frontend disconnected from Project1 WS")
     finally:

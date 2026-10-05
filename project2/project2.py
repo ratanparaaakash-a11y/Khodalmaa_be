@@ -1,9 +1,10 @@
 import asyncio
 
-from fastapi import Request, APIRouter, BackgroundTasks, HTTPException, WebSocket
+from fastapi import Request, APIRouter, BackgroundTasks, Depends, HTTPException, WebSocket
 from history import capture
 from project2 import temporary
 from request_data import json_object
+from security import authenticate_websocket, authorize_machine_request, receive_authenticated_text, require_user
 import time
 Project2Router = APIRouter(prefix="/api/v1")
 
@@ -129,18 +130,26 @@ async def accept_project2_data(data, background_tasks):
 
     try:
         now = time.time()
-        async with _data_lock:
-            if "__temporary_for_seconds" in data:
-                duration = data.pop("__temporary_for_seconds")
-                entry = await asyncio.to_thread(temporary.add, data, duration,
-                                                occupied=latest_project2_data, now=now)
+        if "__temporary_for_seconds" in data:
+            data = dict(data)
+            duration = data.pop("__temporary_for_seconds")
+            # Cloud persistence must not hold the live producer's data lock.
+            async with _data_lock:
+                occupied = tuple(latest_project2_data)
+            entry = await asyncio.to_thread(temporary.add, data, duration, occupied=occupied, now=now)
+            async with _data_lock:
+                if entry["name"] in {name.lower() for name in latest_project2_data}:
+                    await asyncio.to_thread(temporary.remove_for_real, [entry["name"]])
+                    _temporary_wake.set()
+                    raise HTTPException(status_code=409, detail="A live machine now uses this name")
                 _temporary_wake.set()
                 _broadcast_revision += 1
                 payload = with_project2_meta(latest_project2_data)
                 background_tasks.add_task(broadcast_project2_data, payload, _broadcast_revision)
-                return {"status": "success", "data": {entry["name"]: entry["values"]},
-                        "temporary": {"name": entry["name"], "created_at": entry["created_at"],
-                                      "expires_at": entry["expires_at"], "duration_seconds": duration}}
+            return {"status": "success", "data": {entry["name"]: entry["values"]},
+                    "temporary": {"name": entry["name"], "created_at": entry["created_at"],
+                                  "expires_at": entry["expires_at"], "duration_seconds": duration}}
+        async with _data_lock:
             accepted = await asyncio.to_thread(capture.accept_data, "project10", data, now)
             # Only a valid, durably accepted real producer can supersede an overlay.
             if await asyncio.to_thread(temporary.remove_for_real, accepted["data"]):
@@ -167,10 +176,14 @@ async def accept_project2_data(data, background_tasks):
 
 @Project2Router.post("/project2_data")
 async def get_p2_data(req: Request, background_tasks: BackgroundTasks):
-    return await accept_project2_data(await json_object(req), background_tasks)
+    data = await json_object(req)
+    if "__temporary_for_seconds" in data:
+        raise HTTPException(status_code=400, detail="Temporary machines require the signed-in temporary endpoint")
+    authorize_machine_request(req, "project10", data)
+    return await accept_project2_data(data, background_tasks)
 
 
-@Project2Router.post("/project2_temporary_data")
+@Project2Router.post("/project2_temporary_data", dependencies=[Depends(require_user)])
 async def get_p2_temporary_data(req: Request, background_tasks: BackgroundTasks):
     data = await json_object(req)
     if "__temporary_for_seconds" not in data:
@@ -180,16 +193,30 @@ async def get_p2_temporary_data(req: Request, background_tasks: BackgroundTasks)
 
 @Project2Router.websocket("/ws_project2")
 async def ws_project2(websocket: WebSocket):
-    await websocket.accept()
+    claims = await authenticate_websocket(websocket)
+    if claims is None:
+        return
     print("Frontend connected to Project2 WS")
     try:
         async with _broadcast_lock:
             await asyncio.wait_for(websocket.send_json(with_project2_meta(latest_project2_data)), timeout=1)
             connections_project2.append(websocket)
         while True:
-            await websocket.receive_text() 
+            await receive_authenticated_text(websocket, claims)
     except Exception:
         print("Frontend disconnected from Project2 WS")
     finally:
         if websocket in connections_project2:
             connections_project2.remove(websocket)
+
+
+async def temporary_cloud_changed():
+    """Publish recovery/retirement from the independent cloud sync worker."""
+    global _broadcast_revision
+    async with _data_lock:
+        await asyncio.to_thread(temporary.remove_for_real, tuple(latest_project2_data))
+        _temporary_wake.set()
+        _broadcast_revision += 1
+        revision = _broadcast_revision
+        payload = with_project2_meta(latest_project2_data)
+    await broadcast_project2_data(payload, revision)

@@ -16,6 +16,7 @@ from history import capture
 from history import session_history as history
 from project1 import project1
 from project2 import project2
+from request_data import MAX_JSON_BYTES
 from telegram import telegram
 from test_session_capture import CaptureTestCase, p10, p220
 
@@ -43,7 +44,7 @@ class ApiAuditTests(ApiTestCase):
     def test_all_browser_mutators_require_auth_before_any_operation(self):
         for path in ("/api/v1/create_user", "/api/v1/send-alert", "/api/v1/history/snapshot",
                      "/api/v1/history/snapshot-built", "/api/v1/history/snapshot-current",
-                     "/api/v1/project220/sent-low-snapshot"):
+                     "/api/v1/project220/sent-low-snapshot", "/api/v1/project2_temporary_data"):
             with self.subTest(path=path), patch.object(security, "verify_browser_token") as verifier:
                 response = self.request(path, {})
                 self.assertEqual(response.status_code, 401)
@@ -96,6 +97,13 @@ class ApiAuditTests(ApiTestCase):
             with self.subTest(path=path), patch.object(security, "verify_browser_token", return_value={"uid": "user", "admin": True}):
                 self.assertEqual(self.request(path, [], token="test-token").status_code, 400)
                 self.assertEqual(self.request(path, token="test-token", content="{broken-json").status_code, 400)
+
+    def test_account_creation_uses_bounded_json_before_creating_user(self):
+        with patch.object(security, "verify_browser_token", return_value={"uid": "admin", "admin": True}), \
+                patch.object(auth, "create_user") as create:
+            response = self.request("/api/v1/create_user", token="test-token", content=" " * (MAX_JSON_BYTES + 1))
+        self.assertEqual(response.status_code, 413)
+        create.assert_not_called()
 
     def test_machine_ingestion_contract_remains_unauthenticated(self):
         with patch.object(capture, "accept_data", return_value={"recording": False, "data": p10()}), \
@@ -236,6 +244,15 @@ class RecoveryPerformanceTests(CaptureTestCase):
 
 
 class WebSocketAuditTests(unittest.TestCase):
+    def setUp(self):
+        # These tests isolate ordering after the auth gate; auth itself has
+        # handshake/denial coverage in test_security_hardening.py.
+        for module in (project1, project2):
+            mocked = patch.object(module, "authenticate_websocket", new_callable=AsyncMock,
+                                  return_value={"uid": "test-user"})
+            mocked.start()
+            self.addCleanup(mocked.stop)
+
     def test_disconnect_during_initial_send_leaves_no_stale_connection(self):
         class DisconnectedSocket:
             async def accept(self):

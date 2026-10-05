@@ -24,7 +24,7 @@ from history.session_history import (
 HistoryRouter = APIRouter(prefix="/api/v1")
 
 
-@HistoryRouter.get("/history/health")
+@HistoryRouter.get("/history/health", dependencies=[Depends(require_user)])
 async def history_health():
     storage = await asyncio.to_thread(get_storage_status)
     status = "degraded" if storage["recording"]["state"] == "degraded" else (
@@ -33,7 +33,7 @@ async def history_health():
     return {"status": status, "feature": "session_history", "storage": storage}
 
 
-@HistoryRouter.get("/history")
+@HistoryRouter.get("/history", dependencies=[Depends(require_user)])
 async def get_history(
     project: str = Query("project220"),
     session: int = Query(1),
@@ -117,7 +117,7 @@ async def project220_sent_low_snapshot(req: Request):
     return {"status": "success", "result": result}
 
 
-@HistoryRouter.get("/project220/sent-low-calculation")
+@HistoryRouter.get("/project220/sent-low-calculation", dependencies=[Depends(require_user)])
 async def project220_sent_low_calculation(
     business_date: Optional[str] = Query(None),
     session: Optional[int] = Query(None),

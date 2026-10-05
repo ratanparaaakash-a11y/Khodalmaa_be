@@ -375,6 +375,8 @@ class RouteTests(CaptureTestCase):
 
     def test_reversed_background_tasks_cannot_send_stale_window_or_partial_data(self):
         class Request:
+            headers = {}
+
             def __init__(self, data):
                 self.data = data
 
@@ -383,6 +385,9 @@ class RouteTests(CaptureTestCase):
 
             async def body(self):
                 return json.dumps(self.data).encode()
+
+            async def stream(self):
+                yield await self.body()
 
         class Socket:
             def __init__(self):
@@ -413,6 +418,8 @@ class RouteTests(CaptureTestCase):
 
     def test_skipped_outside_background_update_is_included_in_newest_full_payload(self):
         class Request:
+            headers = {}
+
             def __init__(self, data):
                 self.data = data
 
@@ -421,6 +428,9 @@ class RouteTests(CaptureTestCase):
 
             async def body(self):
                 return json.dumps(self.data).encode()
+
+            async def stream(self):
+                yield await self.body()
 
         class Socket:
             messages = []
