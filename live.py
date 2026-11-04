@@ -22,7 +22,9 @@ import json
 import time
 from typing import Dict, List, Optional
 
-HEARTBEAT_SECONDS = 5.0
+# A dropped network path never delivers a close, so the browser can only tell
+# a dead connection by silence. Its watchdog (6 s) must stay well above this.
+HEARTBEAT_SECONDS = 2.0
 SEND_TIMEOUT_SECONDS = 15.0
 CLOSE_TIMEOUT_SECONDS = 2.0
 STALLED_CLOSE_CODE = 1011
