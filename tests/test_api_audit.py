@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import copy
+import json
 import io
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -258,7 +259,7 @@ class WebSocketAuditTests(unittest.TestCase):
             async def accept(self):
                 pass
 
-            async def send_json(self, payload):
+            async def send_text(self, text):
                 raise RuntimeError("client disconnected")
 
         for module, handler, connections in ((project1, project1.ws_project1, "connections_project1"),
@@ -279,11 +280,11 @@ class WebSocketAuditTests(unittest.TestCase):
                 async def accept(self):
                     pass
 
-                async def send_json(self, payload):
+                async def send_text(self, text):
                     if not first_send.is_set():
                         first_send.set()
                         await release_initial.wait()
-                    self.messages.append(copy.deepcopy(payload))
+                    self.messages.append(json.loads(text))
 
                 async def receive_text(self):
                     await disconnect.wait()

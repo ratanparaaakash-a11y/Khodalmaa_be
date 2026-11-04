@@ -1,5 +1,13 @@
 import asyncio
+import sys
 from contextlib import asynccontextmanager
+
+# Render pipes stdout; without line buffering, prints arrive in delayed bursts
+# with wrong timestamps, which hid when viewers actually connected.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 from fastapi import Depends, FastAPI
 from security import MachineCompatibleCORSMiddleware, require_user
@@ -68,10 +76,11 @@ app.include_router(TelegramRouter)
 
 @app.get("/")
 async def ping():
-    return {"status": "ok", "release": "2026-10-05-security-1",
+    return {"status": "ok", "release": "2026-11-04-live-1",
             "features": {"project10_temporary_machines": True,
                          "authenticated_browser_reads": True,
-                         "authenticated_websocket": True}}
+                         "authenticated_websocket": True,
+                         "live_heartbeat": True}}
 
 
 @app.get("/api/v1/auth/verify", dependencies=[Depends(require_user)])

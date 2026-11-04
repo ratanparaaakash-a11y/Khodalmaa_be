@@ -17,9 +17,31 @@ from fastapi import Depends, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 
+REVOCATION_RECHECK_SECONDS = 300
+_revocation_checked_at = {}
+
+
 def verify_browser_token(token):
+    """Verify the signature locally every time; ask Google about revocation at most every 5 minutes.
+
+    verify_id_token without check_revoked uses Google's cached public keys, so it
+    needs no network call. The revocation check is a network round trip on every
+    call, which made each page load and WebSocket wait 0.4-11 s. Re-checking it
+    per user every few minutes keeps revoked or disabled accounts blocked
+    quickly without putting that round trip in front of every request.
+    """
     from firebase.config import auth
-    return auth.verify_id_token(token, check_revoked=True)
+    claims = auth.verify_id_token(token)
+    uid = claims.get("uid") if isinstance(claims, dict) else None
+    now = time.monotonic()
+    checked = _revocation_checked_at.get(uid) if uid else None
+    if checked is None or now - checked >= REVOCATION_RECHECK_SECONDS:
+        claims = auth.verify_id_token(token, check_revoked=True)
+        if uid:
+            if len(_revocation_checked_at) > 4096:
+                _revocation_checked_at.clear()
+            _revocation_checked_at[uid] = now
+    return claims
 
 
 async def require_user(authorization: Optional[str] = Header(None)):

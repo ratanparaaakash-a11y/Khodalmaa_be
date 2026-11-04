@@ -2,6 +2,7 @@ import asyncio
 
 from fastapi import Request, APIRouter, BackgroundTasks, Depends, HTTPException, WebSocket
 from history import capture
+from live import LiveChannel
 from project2 import temporary
 from request_data import json_object
 from security import authenticate_websocket, authorize_machine_request, receive_authenticated_text, require_user
@@ -10,7 +11,8 @@ Project2Router = APIRouter(prefix="/api/v1")
 
 
 latest_project2_data = {}
-connections_project2 = []
+live_project2 = LiveChannel("Project2 WS")
+connections_project2 = live_project2.sockets
 last_project2_hit_at = None
 project2_session_started_at = None
 _data_lock = asyncio.Lock()
@@ -51,39 +53,32 @@ def with_project2_meta(data, session_reset=False):
     return payload
 
 
-async def broadcast_project2_data(payload, revision):
-    async def send_to_connection(conn):
-        try:
-            await asyncio.wait_for(conn.send_json(payload), timeout=1)
-            return None
-        except Exception as e:
-            print(f"Error sending to Project2 WebSocket: {e}")
-            return conn
+def without_expired_temporary(payload, now=None):
+    # Never publish an expired temporary row from an earlier captured payload.
+    instant = time.time() if now is None else now
+    payload = dict(payload)
+    temporary_meta = dict(payload.get("__temporary_machines", {}))
+    for name, entry in list(temporary_meta.items()):
+        if entry["expires_at"] <= instant:
+            payload.pop(name, None)
+            temporary_meta.pop(name)
+    if temporary_meta:
+        payload["__temporary_machines"] = temporary_meta
+    else:
+        payload.pop("__temporary_machines", None)
+    return payload
 
-    async with _broadcast_lock:
-        if revision != _broadcast_revision:
-            return
-        # A background send can wait behind another socket past its deadline.
-        # Never send an expired temporary row from the earlier captured payload.
-        payload = dict(payload)
-        temporary_meta = dict(payload.get("__temporary_machines", {}))
-        for name, entry in list(temporary_meta.items()):
-            if entry["expires_at"] <= time.time():
-                payload.pop(name, None)
-                temporary_meta.pop(name)
-        if temporary_meta:
-            payload["__temporary_machines"] = temporary_meta
-        else:
-            payload.pop("__temporary_machines", None)
-        stale_connections = [
-            conn for conn in await asyncio.gather(
-                *(send_to_connection(conn) for conn in connections_project2.copy())
-            )
-            if conn is not None
-        ]
-        for conn in stale_connections:
-            if conn in connections_project2:
-                connections_project2.remove(conn)
+
+def publish_project2_data(payload, revision):
+    """Publish without waiting on any viewer; a superseded revision is never sent."""
+    if revision != _broadcast_revision:
+        return False
+    live_project2.publish(without_expired_temporary(payload))
+    return True
+
+
+async def broadcast_project2_data(payload, revision):
+    return publish_project2_data(payload, revision)
 
 
 async def temporary_expiry_loop():
@@ -144,8 +139,7 @@ async def accept_project2_data(data, background_tasks):
                     raise HTTPException(status_code=409, detail="A live machine now uses this name")
                 _temporary_wake.set()
                 _broadcast_revision += 1
-                payload = with_project2_meta(latest_project2_data)
-                background_tasks.add_task(broadcast_project2_data, payload, _broadcast_revision)
+                publish_project2_data(with_project2_meta(latest_project2_data), _broadcast_revision)
             return {"status": "success", "data": {entry["name"]: entry["values"]},
                     "temporary": {"name": entry["name"], "created_at": entry["created_at"],
                                   "expires_at": entry["expires_at"], "duration_seconds": duration}}
@@ -164,8 +158,8 @@ async def accept_project2_data(data, background_tasks):
             last_project2_hit_at = now
             filtered_data = dict(accepted["data"])
             _broadcast_revision += 1
-            payload = with_project2_meta(latest_project2_data, session_reset)
-            background_tasks.add_task(broadcast_project2_data, payload, _broadcast_revision)
+            # Non-blocking publish now, not after this producer's response is sent.
+            publish_project2_data(with_project2_meta(latest_project2_data, session_reset), _broadcast_revision)
         return {"status": "success", "data": filtered_data}
     except HTTPException:
         raise
@@ -196,18 +190,15 @@ async def ws_project2(websocket: WebSocket):
     claims = await authenticate_websocket(websocket)
     if claims is None:
         return
-    print("Frontend connected to Project2 WS")
+    print("Frontend connected to Project2 WS", flush=True)
     try:
-        async with _broadcast_lock:
-            await asyncio.wait_for(websocket.send_json(with_project2_meta(latest_project2_data)), timeout=1)
-            connections_project2.append(websocket)
+        live_project2.attach(websocket, without_expired_temporary(with_project2_meta(latest_project2_data)))
         while True:
             await receive_authenticated_text(websocket, claims)
     except Exception:
-        print("Frontend disconnected from Project2 WS")
+        print("Frontend disconnected from Project2 WS", flush=True)
     finally:
-        if websocket in connections_project2:
-            connections_project2.remove(websocket)
+        await live_project2.detach(websocket)
 
 
 async def temporary_cloud_changed():

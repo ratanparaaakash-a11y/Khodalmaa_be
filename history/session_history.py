@@ -545,11 +545,38 @@ def load_firestore_docs():
     return docs
 
 
+FIRESTORE_LIST_CACHE_SECONDS = 120
+_firestore_list_cache = {"loader": None, "at": 0.0, "docs": None}
+_firestore_list_lock = threading.Lock()
+
+
+def cached_firestore_docs():
+    """Firestore listing for read-only History analysis, reused for a short time.
+
+    Listing the whole collection is a network round trip that made every
+    History page wait 1.5-3 s. Documents this process saves are already merged
+    from memory and disk, so a briefly reused cloud listing cannot hide them.
+    Failed reads are never reused.
+    """
+    loader = load_firestore_docs
+    now = time.monotonic()
+    with _firestore_list_lock:
+        cache = _firestore_list_cache
+        if (cache["loader"] is loader and cache["docs"] is not None
+                and now - cache["at"] < FIRESTORE_LIST_CACHE_SECONDS):
+            return copy.deepcopy(cache["docs"])
+    docs = loader()
+    if not firestore_is_disabled():
+        with _firestore_list_lock:
+            _firestore_list_cache.update(loader=loader, at=now, docs=copy.deepcopy(docs))
+    return docs
+
+
 def load_all_docs(project):
     normalized_project = normalize_project(project)
     by_id = {}
 
-    for doc in [*memory_docs_snapshot(), *load_file_docs(), *load_firestore_docs()]:
+    for doc in [*memory_docs_snapshot(), *load_file_docs(), *cached_firestore_docs()]:
         if not isinstance(doc, dict):
             continue
         if doc.get("project") != normalized_project:

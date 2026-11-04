@@ -2,6 +2,7 @@ import asyncio
 
 from fastapi import Request, APIRouter, BackgroundTasks, HTTPException, WebSocket
 from history import capture
+from live import LiveChannel
 from request_data import json_object
 from security import authenticate_websocket, authorize_machine_request, receive_authenticated_text
 import time
@@ -10,7 +11,8 @@ Project1Router = APIRouter(prefix="/api/v1")
 
 # Store latest data for project1 machines
 latest_project1_data = {}
-connections_project1 = []
+live_project1 = LiveChannel("Project1 WS")
+connections_project1 = live_project1.sockets
 last_project1_hit_at = None
 project1_session_started_at = None
 _data_lock = asyncio.Lock()
@@ -36,27 +38,16 @@ def with_project1_meta(data, session_reset=False):
         payload["__session_reset"] = True
     return payload
 
-async def broadcast_project1_data(payload, revision):
-    async def send_to_connection(conn):
-        try:
-            await asyncio.wait_for(conn.send_json(payload), timeout=1)
-            return None
-        except Exception as e:
-            print(f"Error sending to Project1 WebSocket: {e}")
-            return conn
+def publish_project1_data(payload, revision):
+    """Publish without waiting on any viewer; a superseded revision is never sent."""
+    if revision != _broadcast_revision:
+        return False
+    live_project1.publish(payload)
+    return True
 
-    async with _broadcast_lock:
-        if revision != _broadcast_revision:
-            return
-        stale_connections = [
-            conn for conn in await asyncio.gather(
-                *(send_to_connection(conn) for conn in connections_project1.copy())
-            )
-            if conn is not None
-        ]
-        for conn in stale_connections:
-            if conn in connections_project1:
-                connections_project1.remove(conn)
+
+async def broadcast_project1_data(payload, revision):
+    return publish_project1_data(payload, revision)
 
 
 @Project1Router.post("/project1_data")
@@ -80,8 +71,9 @@ async def get_p1_data(req: Request, background_tasks: BackgroundTasks):
             # Full merged payload restores earlier machines after a restart.
             normalized_data = dict(accepted["data"])
             _broadcast_revision += 1
-            payload = with_project1_meta(latest_project1_data, session_reset)
-            background_tasks.add_task(broadcast_project1_data, payload, _broadcast_revision)
+            # Publishing is non-blocking, so do it now instead of after this
+            # producer's (possibly slow) response has been fully sent.
+            publish_project1_data(with_project1_meta(latest_project1_data, session_reset), _broadcast_revision)
         return {"status": "success", "data": normalized_data}
     except HTTPException:
         raise
@@ -94,17 +86,14 @@ async def ws_project1(websocket: WebSocket):
     claims = await authenticate_websocket(websocket)
     if claims is None:
         return
-    print("Frontend connected to Project1 WS")
+    print("Frontend connected to Project1 WS", flush=True)
     try:
-        # Serialize the initial full state with subsequent broadcasts so a slow
-        # initial send cannot arrive after a newer live update.
-        async with _broadcast_lock:
-            await asyncio.wait_for(websocket.send_json(with_project1_meta(latest_project1_data)), timeout=1)
-            connections_project1.append(websocket)
+        # attach() queues the current full state and registers the viewer in
+        # one synchronous step, so a newer live update always arrives after it.
+        live_project1.attach(websocket, with_project1_meta(latest_project1_data))
         while True:
             await receive_authenticated_text(websocket, claims)
     except Exception:
-        print("Frontend disconnected from Project1 WS")
+        print("Frontend disconnected from Project1 WS", flush=True)
     finally:
-        if websocket in connections_project1:
-            connections_project1.remove(websocket)
+        await live_project1.detach(websocket)
