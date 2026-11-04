@@ -13,6 +13,7 @@ import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 
 from history import capture
+from live import LiveChannel
 from history import session_history as history
 from history.history import HistoryRouter, history_health
 from history.rules import HARDCODED_NUM1
@@ -324,10 +325,11 @@ class RouteTests(CaptureTestCase):
         self.app.include_router(HistoryRouter)
         self.app.dependency_overrides[require_user] = lambda: {"uid": "test-user"}
         for module, prefix in ((project1, "project1"), (project2, "project2")):
+            channel = LiveChannel(f"test {prefix}")
             for name, value in ((f"latest_{prefix}_data", {}), (f"{prefix}_session_started_at", None),
                                 (f"last_{prefix}_hit_at", None), ("_data_lock", asyncio.Lock()),
                                 ("_broadcast_lock", asyncio.Lock()), ("_broadcast_revision", 0),
-                                (f"connections_{prefix}", [])):
+                                (f"live_{prefix}", channel), (f"connections_{prefix}", channel.sockets)):
                 mocked = patch.object(module, name, value)
                 mocked.start()
                 self.addCleanup(mocked.stop)
@@ -393,12 +395,13 @@ class RouteTests(CaptureTestCase):
             def __init__(self):
                 self.messages = []
 
-            async def send_json(self, payload):
-                self.messages.append(copy.deepcopy(payload))
+            async def send_text(self, text):
+                self.messages.append(json.loads(text))
 
         async def exercise(module, endpoint, data1, data2, prefix):
             socket = Socket()
-            getattr(module, f"connections_{prefix}").append(socket)
+            channel = getattr(module, f"live_{prefix}")
+            channel.attach(socket)
             first_tasks, second_tasks = BackgroundTasks(), BackgroundTasks()
             with patch.object(capture.time, "time", return_value=self.s1 + 20):
                 await endpoint(Request(data1), first_tasks)
@@ -406,6 +409,8 @@ class RouteTests(CaptureTestCase):
                 await endpoint(Request(data2), second_tasks)
             await second_tasks()
             await first_tasks()
+            await asyncio.sleep(0.05)
+            await channel.detach(socket)
             self.assertEqual(len(socket.messages), 1)
             self.assertEqual(socket.messages[0]["__session_started_at"], self.s2)
             self.assertEqual(socket.messages[0]["machine1"], capture.validate_data(
@@ -435,18 +440,20 @@ class RouteTests(CaptureTestCase):
         class Socket:
             messages = []
 
-            async def send_json(self, payload):
-                self.messages.append(copy.deepcopy(payload))
+            async def send_text(self, text):
+                self.messages.append(json.loads(text))
 
         async def exercise():
             socket = Socket()
-            project2.connections_project2.append(socket)
+            project2.live_project2.attach(socket)
             first_tasks, second_tasks = BackgroundTasks(), BackgroundTasks()
             with patch.object(capture.time, "time", return_value=self.s1 - 120):
                 await project2.get_p2_data(Request(p10(machine="machine1")), first_tasks)
                 await project2.get_p2_data(Request(p10(machine="machine2")), second_tasks)
             await second_tasks()
             await first_tasks()
+            await asyncio.sleep(0.05)
+            await project2.live_project2.detach(socket)
             self.assertEqual(len(socket.messages), 1)
             self.assertEqual(set(socket.messages[0]), {"machine1", "machine2", "__full_snapshot"})
             self.assertTrue(socket.messages[0]["__full_snapshot"])

@@ -139,7 +139,8 @@ async def accept_project2_data(data, background_tasks):
                     raise HTTPException(status_code=409, detail="A live machine now uses this name")
                 _temporary_wake.set()
                 _broadcast_revision += 1
-                publish_project2_data(with_project2_meta(latest_project2_data), _broadcast_revision)
+                payload = with_project2_meta(latest_project2_data)
+                background_tasks.add_task(broadcast_project2_data, payload, _broadcast_revision)
             return {"status": "success", "data": {entry["name"]: entry["values"]},
                     "temporary": {"name": entry["name"], "created_at": entry["created_at"],
                                   "expires_at": entry["expires_at"], "duration_seconds": duration}}
@@ -158,8 +159,8 @@ async def accept_project2_data(data, background_tasks):
             last_project2_hit_at = now
             filtered_data = dict(accepted["data"])
             _broadcast_revision += 1
-            # Non-blocking publish now, not after this producer's response is sent.
-            publish_project2_data(with_project2_meta(latest_project2_data, session_reset), _broadcast_revision)
+            payload = with_project2_meta(latest_project2_data, session_reset)
+            background_tasks.add_task(broadcast_project2_data, payload, _broadcast_revision)
         return {"status": "success", "data": filtered_data}
     except HTTPException:
         raise

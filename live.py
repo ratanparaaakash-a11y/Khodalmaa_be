@@ -40,11 +40,12 @@ def heartbeat_text() -> str:
 class _Viewer:
     __slots__ = ("websocket", "pending", "wake", "task")
 
-    def __init__(self, websocket, initial_text: str):
+    def __init__(self, websocket, initial_text: Optional[str]):
         self.websocket = websocket
         self.pending: Optional[str] = initial_text
         self.wake = asyncio.Event()
-        self.wake.set()
+        if initial_text is not None:
+            self.wake.set()
         self.task: Optional[asyncio.Task] = None
 
 
@@ -59,14 +60,14 @@ class LiveChannel:
     def __len__(self):
         return len(self._viewers)
 
-    def attach(self, websocket, initial_payload) -> None:
+    def attach(self, websocket, initial_payload=None) -> None:
         """Register a viewer and queue its first full snapshot.
 
         Runs synchronously, so no publish can slip in between the snapshot
         being built and the viewer being registered.
         """
         self.detach_nowait(websocket)
-        viewer = _Viewer(websocket, encode(initial_payload))
+        viewer = _Viewer(websocket, None if initial_payload is None else encode(initial_payload))
         self._viewers[id(websocket)] = viewer
         self.sockets.append(websocket)
         viewer.task = asyncio.ensure_future(self._pump(viewer))

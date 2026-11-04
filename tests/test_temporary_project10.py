@@ -10,6 +10,7 @@ import httpx
 from fastapi import FastAPI, HTTPException
 
 from history import capture
+from live import LiveChannel
 from project2 import project2, temporary
 from security import require_user
 from test_session_capture import CaptureTestCase, p10
@@ -22,12 +23,14 @@ MACHINE4_VALUES = [0, 0, 0, 4000, 4000, 4000, 0, 4000, 0, 4000]
 class TemporaryProject10TestCase(CaptureTestCase):
     def setUp(self):
         super().setUp()
+        self.live_channel = LiveChannel("test project10")
         for module, replacements in (
             (temporary, {"_entries": {}, "_retired": {}, "_blocked_names": set(),
                          "_real_generations": {}, "_last_cloud_error": None,
                          "_last_local_error": None}),
             (project2, {
-                "latest_project2_data": {}, "connections_project2": [],
+                "latest_project2_data": {}, "live_project2": self.live_channel,
+                "connections_project2": self.live_channel.sockets,
                 "last_project2_hit_at": None, "project2_session_started_at": None,
                 "_data_lock": asyncio.Lock(), "_broadcast_lock": asyncio.Lock(),
                 "_broadcast_revision": 0, "_temporary_wake": asyncio.Event(),
@@ -341,11 +344,13 @@ class TemporaryProject10ApiTests(TemporaryProject10TestCase):
             project2.latest_project2_data.update(p10(100, "machine1"))
             snapshot = self.snapshot()
             socket = AsyncMock()
-            project2.connections_project2.append(socket)
+            project2.live_project2.attach(socket)
             with patch.object(project2.time, "time", return_value=self.now + 1800):
                 await project2.broadcast_project2_data(snapshot, project2._broadcast_revision)
-            socket.send_json.assert_awaited_once()
-            sent = socket.send_json.call_args.args[0]
+            await asyncio.sleep(0.05)
+            await project2.live_project2.detach(socket)
+            socket.send_text.assert_awaited_once()
+            sent = json.loads(socket.send_text.call_args.args[0])
             self.assertEqual(sent["machine1"], p10(100)["machine1"])
             self.assertNotIn("machine4", sent)
             self.assertNotIn("__temporary_machines", sent)

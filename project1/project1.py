@@ -71,9 +71,8 @@ async def get_p1_data(req: Request, background_tasks: BackgroundTasks):
             # Full merged payload restores earlier machines after a restart.
             normalized_data = dict(accepted["data"])
             _broadcast_revision += 1
-            # Publishing is non-blocking, so do it now instead of after this
-            # producer's (possibly slow) response has been fully sent.
-            publish_project1_data(with_project1_meta(latest_project1_data, session_reset), _broadcast_revision)
+            payload = with_project1_meta(latest_project1_data, session_reset)
+            background_tasks.add_task(broadcast_project1_data, payload, _broadcast_revision)
         return {"status": "success", "data": normalized_data}
     except HTTPException:
         raise
