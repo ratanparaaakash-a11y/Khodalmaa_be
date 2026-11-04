@@ -23,7 +23,9 @@ _temporary_wake = asyncio.Event()
 
 def restore_project2_capture():
     global project2_session_started_at, last_project2_hit_at
-    checkpoint = capture.active_capture("project10")
+    # Outside a recording window, show the last saved session instead of
+    # empty tables; the next session's first update replaces it as usual.
+    checkpoint = capture.active_capture("project10") or capture.latest_capture("project10")
     if checkpoint:
         latest_project2_data.clear()
         latest_project2_data.update(checkpoint["data"])

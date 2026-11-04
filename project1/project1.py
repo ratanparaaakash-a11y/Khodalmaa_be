@@ -22,7 +22,9 @@ _broadcast_revision = 0
 
 def restore_project1_capture():
     global project1_session_started_at, last_project1_hit_at
-    checkpoint = capture.active_capture("project220")
+    # Outside a recording window, show the last saved session instead of
+    # empty tables; the next session's first update replaces it as usual.
+    checkpoint = capture.active_capture("project220") or capture.latest_capture("project220")
     if checkpoint:
         latest_project1_data.clear()
         latest_project1_data.update(checkpoint["data"])

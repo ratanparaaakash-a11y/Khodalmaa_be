@@ -311,6 +311,36 @@ def active_capture(project, now=None):
             raise
 
 
+LATEST_CAPTURE_SCAN_LIMIT = 16
+
+
+def latest_capture(project, now=None):
+    """Newest saved capture, used to refill the live screen after a restart.
+
+    active_capture only covers the current recording window, so a restart
+    between sessions (for example a deploy) used to leave the live tables
+    empty until the next session began. Checkpoint names start with the
+    business date and session number, so the newest sort last.
+    """
+    project = history.normalize_project(project)
+    instant = time.time() if now is None else float(now)
+    directory = capture_directory()
+    if not directory.exists():
+        return None
+    paths = sorted(directory.glob(f"*-s[12]-{project}.json"), reverse=True)
+    for path in paths[:LATEST_CAPTURE_SCAN_LIMIT]:
+        key = path.stem
+        with _lock:
+            try:
+                checkpoint = read_checkpoint(key)
+            except Exception as error:
+                record_error(key, error)
+                continue
+        if checkpoint and checkpoint["last_received_at"] <= instant:
+            return copy.deepcopy(checkpoint)
+    return None
+
+
 def snapshot_current(project, session_override=None, now=None):
     project = history.normalize_project(project)
     if session_override is not None:
